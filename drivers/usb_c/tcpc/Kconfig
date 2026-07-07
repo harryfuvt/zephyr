@@ -25,6 +25,18 @@ config USBC_TCPC_SHELL
 	  Enable support for TCPC shell commands that helps with USB-C diagnostics.
 	  Example functions are printing vbus, chip information and dumping registers.
 
+config USBC_TCPC_RAA489400
+    bool "Renesas RAA489400 USB Type-C Port Controller"
+    default y
+    depends on DT_HAS_RENESAS_RAA489400_ENABLED
+    depends on GPIO
+    select USBC_TCPC_TCPCI
+    help
+      Enable driver for the Renesas RAA489400 USB Type-C Port
+      Controller (TCPC). The RAA489400 implements TCPCi Revision 2.0
+      with Extended Power Range (EPR) support up to 240W/48V.
+      Communicates with the TCPM over SMBus/I2C.
+
 source "drivers/usb_c/tcpc/Kconfig.tcpc_stm32"
 source "drivers/usb_c/tcpc/Kconfig.tcpc_numaker"
 source "drivers/usb_c/tcpc/Kconfig.tcpc_tcpci"

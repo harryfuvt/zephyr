@@ -1,0 +1,123 @@
+# Copyright (c) 2024 Renesas Electronics Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Binding for the Renesas RAA489400 USB Type-C Port Controller (TCPC)
+# Datasheet: R16DS0292EU0100 Rev.1.00
+#
+# Node example:
+#
+#   &i2c0 {
+#       raa489400_tcpc0: raa489400@22 {
+#           compatible = "renesas,raa489400";
+#           reg = <0x22>;            /* PROG = 1kΩ → addr 0x22 */
+#           alert-gpios = <&gpio0 5 GPIO_ACTIVE_LOW>;
+#       };
+#   };
+
+description: Renesas RAA489400 USB Type-C Port Controller (TCPC)
+
+compatible: "renesas,raa489400"
+
+include: [i2c-device.yaml, base.yaml]
+
+properties:
+  reg:
+    required: true
+    description: |
+      I2C slave address, set by PROG resistor to GND.
+        0x22  PROG = 1.0 kΩ
+        0x23  PROG = 1.5 kΩ
+        0x24  PROG = 2.2 kΩ
+        0x25  PROG = 3.3 kΩ
+        0x26  PROG = 4.7 kΩ
+        0x27  PROG = 6.8 kΩ
+
+  alert-gpios:
+    type: phandle-array
+    required: true
+    description: |
+      GPIO connected to the ALERT# pin (active-low, open-drain).
+      Must be configured with GPIO_ACTIVE_LOW and GPIO_PULL_UP.
+      ALERT# asserts when any unmasked event occurs in the ALERT
+      register (0x10). The host must read and clear ALERT bits
+      inside the alert handler.
+
+  vconn-ctrl-gpios:
+    type: phandle-array
+    required: false
+    description: |
+      Optional GPIO to enable/disable an external VCONN switch
+      instead of using the RAA489400 internal VCONN MUX.
+      If omitted, the internal VCONN_POWER MUX is used.
+
+  ocp-gpios:
+    type: phandle-array
+    required: false
+    description: |
+      Optional GPIO connected to OCP# pin (active-low, open-drain).
+      Active when a fault configured in OCP_OUTPUT_CTRL (0xA8) is
+      detected (VBUS/VCONN OCP, OVP, UVP, RVP).
+
+  prochot-gpios:
+    type: phandle-array
+    required: false
+    description: |
+      Optional GPIO connected to PROCHOT# pin (active-low, open-drain).
+      Asserts on VBUS source disconnection or Fast Role Swap event
+      as configured in PROCHOT_EN register (0xAA).
+
+  vbus-path-src-sel:
+    type: int
+    required: false
+    default: 0
+    description: |
+      VBUS source path switch selection (VBUS_PATH_CTRL register bits [7:5]).
+        0  Use VSRC_GATE/VSRC_SRC/VSRC_BOOT pins (internal N-FET driver)
+        1  Use GPIO1 as VBUS source enable output
+        2  Use GPIO2 as VBUS source enable output
+        3  Use GPIO3 as VBUS source enable output
+        4  Use GPIO4 as VBUS source enable output
+    enum: [0, 1, 2, 3, 4]
+
+  vbus-path-snk-sel:
+    type: int
+    required: false
+    default: 0
+    description: |
+      VBUS sink path switch selection (VBUS_PATH_CTRL register bits [3:1]).
+        0  Use VSNK_GATE/VSNK_SRC pins (internal N-FET driver)
+        1  Use GPIO1 as VBUS sink enable output
+        2  Use GPIO2 as VBUS sink enable output
+        3  Use GPIO3 as VBUS sink enable output
+        4  Use GPIO4 as VBUS sink enable output
+    enum: [0, 1, 2, 3, 4]
+
+  vbus-oc-threshold:
+    type: int
+    required: false
+    default: 1
+    description: |
+      VBUS overcurrent threshold (VBUS_FAULT_CTRL register bits [1:0]).
+        0  1.8 A
+        1  3.6 A  (default)
+        2  4.8 A
+        3  6.0 A
+    enum: [0, 1, 2, 3]
+
+  vconn-oc-threshold:
+    type: int
+    required: false
+    default: 1
+    description: |
+      VCONN overcurrent threshold (VCONN_FAULT_CTRL register bits [1:0]).
+        0  400 mA
+        1  600 mA  (default)
+        2  800 mA
+    enum: [0, 1, 2]
+
+  epr-support:
+    type: boolean
+    description: |
+      If present, enables EPR (Extended Power Range) operation up to
+      48 V / 240 W. Sets VBUS overvoltage threshold to vEprMax (54 V typ)
+      instead of vSprMax (23.4 V typ) in VBUS_FAULT_CTRL register (0xA4).

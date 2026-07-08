@@ -7,6 +7,18 @@
  * Place this file at:
  *   samples/subsys/usb_c/sink/boards/ek_ra6m4.overlay
  *
+ * ── VBUS measurement note ───────────────────────────────────────
+ *  VBUS voltage is read over I2C from the RAA489400's own ADC
+ *  (VBUS_VOLTAGE register 0x70) using the generic
+ *  "zephyr,usb-c-vbus-tcpci" driver, declared as a child node of
+ *  the TCPC. NO SoC ADC or resistor divider is used, so the adc0
+ *  node and the P000/AN000 divider are gone.
+ *
+ *  IMPORTANT: the RAA489400 driver must clear POWER_CONTROL (0x1C)
+ *  bit6 (VBUS_VOLTAGE Monitor) during init — it defaults to 1b
+ *  (monitoring disabled), which makes VBUS_VOLTAGE read 0x0000.
+ *  The updated raa489400.c does this in raa489400_init().
+ *
  * ── Hardware connections on EK-RA6M4 ────────────────────────────
  *  RAA489400 pin     EK-RA6M4 pin   Notes
  *  ───────────────   ────────────   ────────────────────────────────
@@ -16,12 +28,11 @@
  *                                   Arduino J23-3 (D2/INT0)
  *  VSYS33 (pin 12)   3.3V rail
  *  VCONN_POWER(30)   5V rail        Required for VCONN MUX
- *  VBUS  (pin 14)    USB-C VBUS
+ *  VBUS  (pin 14)    USB-C VBUS     (sensed internally by the TCPC)
  *  VSNK_GATE (18)    N-FET gate     External sink path MOSFET
  *  VSNK_SRC  (19)    N-FET source   External sink path MOSFET
  *  PROG  (pin 10)    1.0 kΩ to GND  → I2C address 0x22 (Table 1, datasheet)
  *  GND   (pin 24)    GND
- *  VBUS divider      P000 (AN000)   330kΩ upper + 49.9kΩ lower → adc0 ch0
  *
  *  IIC1 (P511/P512) is exposed on the EK-RA6M4 Arduino I2C header
  *  (J24-9 SDA / J24-10 SCL), Grove 1 (J27), Qwiic (J30), and mikroBUS
@@ -33,8 +44,6 @@
  * ── Key facts from ra6-cm33-common.dtsi ─────────────────────────
  *  iic0 @ 0x4009f000   compatible = "renesas,ra-iic"   (no fixed irqs)
  *  iic1 @ 0x4009f100   compatible = "renesas,ra-iic"
- *  adc0 @ 0x40170000   compatible = "renesas,ra-adc12" irq=<38 1>
- *  adc1 @ 0x40170200   compatible = "renesas,ra-adc12" irq=<39 1>
  *
  * ── IMPORTANT: IIC interrupt note ───────────────────────────────
  *  The RA6M4 uses a flexible interrupt matrix (ICU). IIC interrupts
@@ -52,9 +61,7 @@
 
 #include <zephyr/dt-bindings/gpio/gpio.h>
 #include <zephyr/dt-bindings/i2c/i2c.h>
-#include <zephyr/dt-bindings/adc/adc.h>
 #include <zephyr/dt-bindings/usb-c/pd.h>
-/*#include <dt-bindings/pinctrl/renesas/ra-pinctrl.h>*/
 
 /* ================================================================
  * 1. Pin control — IIC1 default state
@@ -63,15 +70,13 @@
  *    Both must be open-drain for I2C.
  * ================================================================ */
 &pinctrl {
-    iic1_default: iic1_default {
-        group1 {
-            psels = <RA_PSEL(RA_PSEL_I2C, 5, 12)>,  /* P512 = SCL1 */
-                    <RA_PSEL(RA_PSEL_I2C, 5, 11)>;   /* P511 = SDA1 */
-            drive-open-drain;
-        };
-    };
-    /* P000 = AN000 is a dedicated analog pin — no pinctrl entry needed.
-     * The RA ADC driver selects channels via register config only.    */
+	iic1_default: iic1_default {
+		group1 {
+			psels = <RA_PSEL(RA_PSEL_I2C, 5, 12)>,  /* P512 = SCL1 */
+				<RA_PSEL(RA_PSEL_I2C, 5, 11)>;   /* P511 = SDA1 */
+			drive-open-drain;
+		};
+	};
 };
 
 /* ================================================================
@@ -86,113 +91,94 @@
  *      grep -A6 "iic1" build/zephyr/zephyr.dts
  * ================================================================ */
 &iic1 {
-    status = "okay";
-    pinctrl-0 = <&iic1_default>;
-    pinctrl-names = "default";
-    clock-frequency = <I2C_BITRATE_FAST>;   /* 400 kHz */
-    #address-cells = <1>;
-    #size-cells = <0>;
-    interrupts = <32 1>, <33 1>, <34 1>, <35 1>;
-    interrupt-names = "rxi", "txi", "tei", "eri";
+	status = "okay";
+	pinctrl-0 = <&iic1_default>;
+	pinctrl-names = "default";
+	clock-frequency = <I2C_BITRATE_FAST>;   /* 400 kHz */
+	#address-cells = <1>;
+	#size-cells = <0>;
+	interrupts = <32 1>, <33 1>, <34 1>, <35 1>;
+	interrupt-names = "rxi", "txi", "tei", "eri";
 
-    /* ── RAA489400 TCPC at I2C address 0x22 ─────────────────────
-     * PROG pin = 1.0 kΩ to GND → address 0x22 (Table 1, datasheet)
-     * ALERT# = P009 (ioport0, pin 9), active-low open-drain.
-     *   P009 is IRQ13-capable and exposed on the Arduino digital
-     *   header at J23-3 (D2/INT0). It carries no default on-board
-     *   function, so it is free for use as the TCPC ALERT# input.
-     *
-     *   NOTE: the previous P105 assignment was invalid — on the
-     *   EK-RA6M4, P105 is OSPI DQ5 (Table 23) and is committed to
-     *   the on-board Octo-SPI flash.
-     * ─────────────────────────────────────────────────────────── */
-    raa489400_tcpc0: raa489400@22 {
-        compatible = "renesas,raa489400";
-        reg = <0x22>;
-        alert-gpios = <&ioport0 9 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+	/* ── RAA489400 TCPC at I2C address 0x22 ─────────────────────
+	 * PROG pin = 1.0 kΩ to GND → address 0x22 (Table 1, datasheet)
+	 * ALERT# = P009 (ioport0, pin 9), active-low open-drain.
+	 *   P009 is IRQ13-capable and exposed on the Arduino digital
+	 *   header at J23-3 (D2/INT0). It carries no default on-board
+	 *   function, so it is free for use as the TCPC ALERT# input.
+	 * ─────────────────────────────────────────────────────────── */
+	raa489400_tcpc0: raa489400@22 {
+		compatible = "renesas,raa489400";
+		reg = <0x22>;
+		alert-gpios = <&ioport0 9 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
 
-        /*
-         * VBUS overcurrent threshold = 3.6 A (reset value from
-         * RAA489400 VBUS_FAULT_CTRL register bits[1:0] = 01b).
-         */
-        vbus-oc-threshold = <1>;
+		/*
+		 * VBUS overcurrent threshold = 3.6 A (reset value from
+		 * RAA489400 VBUS_FAULT_CTRL register bits[1:0] = 01b).
+		 */
+		vbus-oc-threshold = <1>;
 
-        status = "okay";
-    };
+		status = "okay";
+
+		/* ── VBUS voltage measurement over I2C ───────────────
+		 * The generic TCPCI VBUS driver reads VBUS_VOLTAGE
+		 * (0x70) from the parent TCPC. It takes the I2C address
+		 * from this node's parent (raa489400@22). No SoC ADC.
+		 *
+		 * NOTE: raa489400_init() must clear POWER_CONTROL bit6
+		 * (VBUS_VOLTAGE Monitor) or this register reads 0.
+		 * ──────────────────────────────────────────────────── */
+		vbus0: vbus {
+			compatible = "zephyr,usb-c-vbus-tcpci";
+			status = "okay";
+		};
+	};
 };
 
 /* ================================================================
- * 3. ADC0 — 12-bit ADC for VBUS voltage measurement
- *
- *    From ra6-cm33-common.dtsi:
- *      adc0 @ 0x40170000, compatible = "renesas,ra-adc12"
- *      interrupts = <38 1>, interrupt-names = "scanend"
- *      unit = <0>, vref-mv = <3300>
- *
- *    Channel 0 = AN000 = P000.
- * ================================================================ */
-&adc0 {
-    status = "okay";
-    /* No pinctrl needed — P000/AN000 is a dedicated analog pin */
-};
-
-/* ================================================================
- * 4. Enable GPIO ports
+ * 3. Enable GPIO ports
  * ================================================================ */
 /* Port 5 — for IIC1 pins P511/P512 */
 &ioport5 {
-    status = "okay";
+	status = "okay";
 };
 
-/* Port 0 — for ADC AN000 on P000 and ALERT# on P009 */
+/* Port 0 — for ALERT# on P009 */
 &ioport0 {
-    status = "okay";
+	status = "okay";
 };
 
 /* ================================================================
- * 5. Root node — aliases, VBUS, and USB-C port
+ * 4. Root node — aliases and USB-C port
  * ================================================================ */
 / {
-    aliases {
-        usbc-port0 = &port0;
-    };
+	aliases {
+		usbc-port0 = &port0;
+	};
 
-    /* ── VBUS voltage measurement ────────────────────────────────
-     * Resistor divider on VBUS line → P000 (AN000, adc0 ch0):
-     *   Upper: 330 kΩ   Lower: 49.9 kΩ
-     *   Full-scale: (3.3V × (330k + 49.9k) / 49.9k) ≈ 25.1 V
-     *   Sufficient for SPR (up to 20V) and partial EPR coverage.
-     *
-     * For full EPR (up to 48V), increase upper resistor to ~910kΩ:
-     *   output-ohms = <49900>
-     *   full-ohms   = <959900>   (910k + 49.9k)
-     * ─────────────────────────────────────────────────────────── */
-    vbus0: vbus {
-        compatible = "zephyr,usb-c-vbus-adc";
-        io-channels = <&adc0 0>;        /* AN000 = P000 = channel 0 */
-        output-ohms  = <49900>;         /* lower leg of divider      */
-        full-ohms    = <379900>;        /* 330000 + 49900            */
-        status = "okay";
-    };
+	/* ── USB-C port (sink only) ──────────────────────────────────
+	 * PDOs: 5V/3A, 9V/3A, 15V/3A, 20V/3A
+	 * RAA489400 supports EPR up to 48V/240W — add EPR PDOs if needed.
+	 *
+	 * VBUS stays under 25.6V for all SPR PDOs, so the TCPC's
+	 * VBUS_VOLTAGE scale factor is always 00b (raw × 25 mV). If you
+	 * add EPR PDOs above 25.6V, verify the TCPCI VBUS driver reads
+	 * the scale-factor field (bits 11:10 of reg 0x70).
+	 * ─────────────────────────────────────────────────────────── */
+	ports {
+		#address-cells = <1>;
+		#size-cells    = <0>;
 
-    /* ── USB-C port (sink only) ──────────────────────────────────
-     * PDOs: 5V/3A, 9V/3A, 15V/3A, 20V/3A
-     * RAA489400 supports EPR up to 48V/240W — add EPR PDOs if needed.
-     * ─────────────────────────────────────────────────────────── */
-    ports {
-        #address-cells = <1>;
-        #size-cells    = <0>;
-
-        port0: usbc-port@0 {
-            compatible = "usb-c-connector";
-            reg        = <0>;
-            tcpc       = <&raa489400_tcpc0>;
-            vbus       = <&vbus0>;
-            power-role = "sink";
-            sink-pdos  = <PDO_FIXED(5000,  3000, 0)
-                          PDO_FIXED(9000,  3000, 0)
-                          PDO_FIXED(15000, 3000, 0)
-                          PDO_FIXED(20000, 3000, 0)>;
-        };
-    };
+		port0: usbc-port@0 {
+			compatible = "usb-c-connector";
+			reg        = <0>;
+			tcpc       = <&raa489400_tcpc0>;
+			vbus       = <&vbus0>;
+			power-role = "sink";
+			sink-pdos  = <PDO_FIXED(5000,  3000, 0)
+				      PDO_FIXED(9000,  3000, 0)
+				      PDO_FIXED(15000, 3000, 0)
+				      PDO_FIXED(20000, 3000, 0)>;
+		};
+	};
 };

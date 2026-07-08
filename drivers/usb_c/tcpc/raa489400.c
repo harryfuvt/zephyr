@@ -200,6 +200,25 @@ static int raa489400_init(const struct device *dev)
 		return ret;
 	}
 
+	/* 6a. Enable VBUS voltage monitoring.
+	 *
+	 * POWER_CONTROL (0x1C) bit6 (VBUS_VOLTAGE Monitor) has a reset
+	 * value of 1b (monitoring DISABLED) — POWER_CONTROL resets to
+	 * 0x62. While this bit is set, VBUS_VOLTAGE (0x70) reads all
+	 * zeroes. The zephyr,usb-c-vbus-tcpci VBUS driver reads VBUS
+	 * over I2C from register 0x70, so this bit MUST be cleared or
+	 * the USB-C stack never sees VBUS present.
+	 *
+	 * Clearing bit6 (write 0) enables VBUS voltage monitoring.
+	 */
+	ret = tcpci_update_reg8(&cfg->bus,
+				RAA489400_REG_POWER_CONTROL,
+				RAA489400_PWR_CTRL_VBUS_MON_DIS,
+				0);
+	if (ret) {
+		return ret;
+	}
+
 	/* 7. Unmask alerts: CC | POWER | FAULT | RX | TX | SNK_DISC | VENDOR */
 	ret = tcpci_tcpm_mask_status_register(
 		&cfg->bus, TCPC_ALERT_STATUS,

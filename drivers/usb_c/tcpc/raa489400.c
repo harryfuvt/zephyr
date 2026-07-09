@@ -252,7 +252,9 @@ static int raa489400_init(const struct device *dev)
 	ret = gpio_pin_interrupt_configure_dt(&cfg->alert_gpio,
 					      GPIO_INT_EDGE_FALLING);
 	if (ret) {
-		return ret;
+		LOG_WRN("ALERT# IRQ unavailable (%d); running without interrupt", ret);
+    	ret = 0;
+		// return ret;
 	}
 
 	LOG_INF("RAA489400 TCPC initialized (addr 0x%02x)", cfg->bus.addr);

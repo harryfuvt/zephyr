@@ -143,10 +143,16 @@
 	status = "okay";
 };
 
-/* Port 0 — for ALERT# on P009 */
-&ioport0 {
+&port_irq13 {
+	interrupts = <90 12>;
 	status = "okay";
 };
+
+&ioport0 {
+	status = "okay";
+	/* no irqs property — routing is via pinctrl above */
+};
+
 
 /* ================================================================
  * 4. Root node — aliases and USB-C port

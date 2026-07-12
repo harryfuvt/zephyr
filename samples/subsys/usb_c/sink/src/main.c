@@ -327,7 +327,12 @@ int main(void)
 		if (atomic_test_and_clear_bit(&port0_data.ps_ready, 0)) {
 			/* Display the Source Capabilities */
 			display_source_caps(usbc_port0);
-		}
+		} 
+
+		// r = tcpc_get_chip_info(tcpc, &info);
+	    // LOG_INF("chip_info ret=%d vendor=0x%04x product=0x%04x",
+		// r, info.vendor_id, info.product_id);
+
 
 		/* Arbitrary delay */
 		k_msleep(1000);

@@ -256,6 +256,8 @@ static int raa489400_init(const struct device *dev)
     	// ret = 0;
 		return ret;
 	}
+	/* Clear any pending alerts latched during init so ALERT# starts deasserted */
+	tcpci_write_reg16(&cfg->bus, TCPC_REG_ALERT, 0xFFFF);
 
 	LOG_INF("RAA489400 TCPC initialized (addr 0x%02x)", cfg->bus.addr);
 	return 0;
@@ -627,9 +629,14 @@ static void raa489400_alert_work_handler(struct k_work *work)
 		case TCPC_ALERT_CC_STATUS:
 			bit = TCPC_REG_ALERT_CC_STATUS;
 			break;
-		case TCPC_ALERT_POWER_STATUS:
+		case TCPC_ALERT_POWER_STATUS: {
+			// uint8_t pstat = 0;
+			// tcpci_read_reg8(&cfg->bus,
+			// 		TCPC_REG_POWER_STATUS, &pstat);
+			// LOG_DBG("POWER_STATUS = 0x%02x", pstat);
 			bit = TCPC_REG_ALERT_POWER_STATUS;
 			break;
+		}
 		case TCPC_ALERT_MSG_STATUS:
 			bit = TCPC_REG_ALERT_RX_STATUS;
 			data->msg_pending = true;

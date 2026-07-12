@@ -238,14 +238,14 @@ static int i2c_ra_iic_transfer(const struct device *dev, struct i2c_msg *msgs, u
 	/* Process input `msgs`. */
 
 	current = msgs;
-
+	int attempts = 0;
 	while (num_msgs > 0) {
 		if (num_msgs > 1) {
 			next = current + 1;
 		} else {
 			next = NULL;
 		}
-
+#if 0		
 		if (current->flags & I2C_MSG_READ) {
 			fsp_err =
 				R_IIC_MASTER_Read(&data->control_ctrl, current->buf, current->len,
@@ -276,9 +276,56 @@ static int i2c_ra_iic_transfer(const struct device *dev, struct i2c_msg *msgs, u
 			ret = -EIO;
 			goto RELEASE_BUS;
 		}
-
 		/* Wait for callback to return. */
 		k_sem_take(&data->complete_sem, K_FOREVER);
+#else
+retry_xfer:
+		if (current->flags & I2C_MSG_READ) {
+			fsp_err =
+				R_IIC_MASTER_Read(&data->control_ctrl, current->buf, current->len,
+						  next != NULL && (next->flags & I2C_MSG_RESTART));
+		} else {
+			fsp_err =
+				R_IIC_MASTER_Write(&data->control_ctrl, current->buf, current->len,
+						   next != NULL && (next->flags & I2C_MSG_RESTART));
+		}
+		if (fsp_err == FSP_ERR_IN_USE && attempts++ < 8) {
+			/* Peripheral left busy by a prior aborted transfer.
+			 * Force it back to ready and retry.
+			 */
+			R_IIC_MASTER_Abort(&data->control_ctrl);
+			k_msleep(1);
+			goto retry_xfer;
+		}
+		if (fsp_err != FSP_SUCCESS) {
+			switch (fsp_err) {
+			case FSP_ERR_INVALID_SIZE:
+				LOG_ERR("%s: Provided number of bytes more than uint16_t size "
+					"(65535) while DTC is used for data transfer.",
+					__func__);
+				break;
+			case FSP_ERR_IN_USE:
+				LOG_ERR("%s: Bus busy condition. Another transfer was in progress.",
+					__func__);
+				break;
+			default:
+				/* Should not reach here. */
+				LOG_ERR("%s: Unknown error. FSP_ERR=%d\n", __func__, fsp_err);
+				break;
+			}
+
+			ret = -EIO;
+			goto RELEASE_BUS;
+		}
+		/* Wait for callback, but with a timeout so an aborted transfer
+		 * that never calls back can't block forever.
+		 */
+		if (k_sem_take(&data->complete_sem, K_MSEC(50)) != 0) {
+			R_IIC_MASTER_Abort(&data->control_ctrl);
+			ret = -EIO;
+			goto RELEASE_BUS;
+		}
+#endif
 
 		/* Handle event msg from callback. */
 		switch (data->ctrl_event) {

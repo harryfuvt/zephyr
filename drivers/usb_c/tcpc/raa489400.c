@@ -59,6 +59,12 @@ struct raa489400_data {
 	struct gpio_callback alert_cb;
 	/** Work item: handle alert outside ISR context */
 	struct k_work alert_work;
+	/** Serializes all I2C access to the chip between the alert work
+	 *  handler (system workqueue thread) and the TCPC API calls made
+	 *  by the USB-C stack thread. Without this, the two contexts issue
+	 *  overlapping transfers on the shared bus and the RA IIC master
+	 *  reports "Another transfer was in progress" / "Write failed". */
+	struct k_mutex bus_lock;
 	/** Alert callback registered by USB-C stack */
 	tcpc_alert_handler_cb_t alert_handler;
 	/** Opaque data passed back to alert_handler */
@@ -73,6 +79,10 @@ struct raa489400_data {
 	/** One-slot RX FIFO */
 	struct pd_msg rx_msg;
 	bool msg_pending;
+	/** True once init has fully completed and alerts may be serviced.
+	 *  Guards the alert work handler against touching I2C while init
+	 *  is still mid-sequence (the two would collide on the bus). */
+	bool initialized;
 };
 
 /* ================================================================
@@ -146,6 +156,14 @@ static int raa489400_init(const struct device *dev)
 	uint8_t pwr_status;
 	int ret;
 
+    if (data->initialized) {
+        LOG_DBG("RAA489400 already initialized");
+        return 0;
+    }
+
+	k_mutex_init(&data->bus_lock);
+	k_work_init(&data->alert_work, raa489400_alert_work_handler);
+	
 	/* 1. Verify I2C bus is ready */
 	if (!i2c_is_ready_dt(&cfg->bus)) {
 		LOG_ERR("I2C bus not ready");
@@ -236,7 +254,8 @@ static int raa489400_init(const struct device *dev)
 
 	/* 8. Configure ALERT# GPIO interrupt (active-low falling edge) */
 	data->dev = dev;
-	k_work_init(&data->alert_work, raa489400_alert_work_handler);
+	// k_mutex_init(&data->bus_lock);
+	// k_work_init(&data->alert_work, raa489400_alert_work_handler);
 
 	ret = gpio_pin_configure_dt(&cfg->alert_gpio, GPIO_INPUT);
 	if (ret) {
@@ -249,17 +268,36 @@ static int raa489400_init(const struct device *dev)
 	if (ret) {
 		return ret;
 	}
+
+	/* Clear any alert bits latched during init so ALERT# starts
+	 * deasserted, THEN mark the driver ready. Both must happen
+	 * before the interrupt is enabled: if the IRQ fired now, the
+	 * work handler would issue I2C while this init sequence is
+	 * still running, and the two would collide on the bus
+	 * ("Another transfer was in progress"). */
+	tcpci_write_reg16(&cfg->bus, TCPC_REG_ALERT, 0xFFFF);
+	data->initialized = true;
+
+	LOG_INF("RAA489400 TCPC initialized (addr 0x%02x)", cfg->bus.addr);
+
+	/* NOW enable the interrupt — init I2C is finished. */
 	ret = gpio_pin_interrupt_configure_dt(&cfg->alert_gpio,
 					      GPIO_INT_EDGE_FALLING);
 	if (ret) {
-		// LOG_WRN("ALERT# IRQ unavailable (%d); running without interrupt", ret);
-    	// ret = 0;
-		return ret;
+		/* Not fatal for bring-up: the USB-C stack still polls
+		 * CC/power periodically, so the port can operate (with
+		 * higher latency) even if the ALERT# line can't raise an
+		 * interrupt on this board. */
+		LOG_WRN("ALERT# IRQ unavailable (%d); running without interrupt",
+			ret);
+		return 0;
 	}
-	/* Clear any pending alerts latched during init so ALERT# starts deasserted */
-	tcpci_write_reg16(&cfg->bus, TCPC_REG_ALERT, 0xFFFF);
 
-	LOG_INF("RAA489400 TCPC initialized (addr 0x%02x)", cfg->bus.addr);
+	/* An alert may have latched between the 0xFFFF clear above and
+	 * the interrupt being enabled. With an edge-triggered line that
+	 * produces no new edge, so drain once explicitly. */
+	k_work_submit(&data->alert_work);
+
 	return 0;
 }
 
@@ -278,11 +316,13 @@ static int raa489400_get_cc(const struct device *dev,
 	struct raa489400_data *data = dev->data;
 	int ret;
 
+	k_mutex_lock(&data->bus_lock, K_FOREVER);
 	ret = tcpci_tcpm_get_cc(&cfg->bus, cc1, cc2);
 	if (ret == 0) {
 		data->cc1 = *cc1;
 		data->cc2 = *cc2;
 	}
+	k_mutex_unlock(&data->bus_lock);
 	return ret;
 }
 
@@ -295,8 +335,13 @@ static int raa489400_get_cc(const struct device *dev,
 static int raa489400_set_cc(const struct device *dev, enum tc_cc_pull pull)
 {
 	const struct raa489400_cfg *cfg = dev->config;
+	struct raa489400_data *data = dev->data;
+	int ret;
 
-	return tcpci_tcpm_set_cc(&cfg->bus, pull);
+	k_mutex_lock(&data->bus_lock, K_FOREVER);
+	ret = tcpci_tcpm_set_cc(&cfg->bus, pull);
+	k_mutex_unlock(&data->bus_lock);
+	return ret;
 }
 
 /* ================================================================
@@ -382,12 +427,40 @@ static int raa489400_set_roles(const struct device *dev,
 static int raa489400_set_rx_enable(const struct device *dev, bool enable)
 {
 	const struct raa489400_cfg *cfg = dev->config;
+	struct raa489400_data *data = dev->data;
+	int ret;
 
 	/* Enable SOP + Hard Reset detection when active; 0 to disable.
 	 * TCPC_REG_RX_DETECT_SOP_HRST_MASK = SOP | Hard Reset combined. */
 	uint8_t rx_type = enable ? TCPC_REG_RX_DETECT_SOP_HRST_MASK : 0;
 
-	return tcpci_tcpm_set_rx_type(&cfg->bus, rx_type);
+	k_mutex_lock(&data->bus_lock, K_FOREVER);
+
+	/* The RAA489400 (like other FUSB307B-family TCPCs) can silently
+	 * fail to latch RECEIVE_DETECT (0x2F) on the first write, after
+	 * which the BMC receiver never arms and every incoming PD message
+	 * is dropped — the sink then times out in Wait_For_Capabilities
+	 * and hard-resets in a loop. Write, read back, and retry until it
+	 * sticks (bounded), so RX is guaranteed enabled. */
+	for (int attempt = 0; attempt < 3; attempt++) {
+		uint8_t rb = 0xFF;
+
+		ret = tcpci_tcpm_set_rx_type(&cfg->bus, rx_type);
+		if (ret) {
+			continue;
+		}
+
+		ret = tcpci_read_reg8(&cfg->bus, TCPC_REG_RX_DETECT, &rb);
+		if (ret == 0 && rb == rx_type) {
+			break;   /* confirmed */
+		}
+		LOG_WRN("RECEIVE_DETECT wrote 0x%02x read 0x%02x (retry %d)",
+			rx_type, rb, attempt);
+		ret = -EIO;
+	}
+
+	k_mutex_unlock(&data->bus_lock);
+	return ret;
 }
 
 /* ================================================================
@@ -407,6 +480,8 @@ static int raa489400_get_rx_pending_msg(const struct device *dev,
 	int rx_data_size;
 	int ret;
 
+	k_mutex_lock(&data->bus_lock, K_FOREVER);
+
 	/* ── Read the RX buffer at register TCPC_REG_RX_BUFFER (0x30) ──
 	 * TCPCi Rev2.0 layout (single I2C burst from 0x30):
 	 *   Byte 0: READABLE_BYTE_COUNT  = M + 2
@@ -418,18 +493,21 @@ static int raa489400_get_rx_pending_msg(const struct device *dev,
 	/* Read byte count */
 	ret = tcpci_read_reg8(&cfg->bus, TCPC_REG_RX_BUFFER, &rxbcnt);
 	if (ret) {
+		k_mutex_unlock(&data->bus_lock);
 		return ret;
 	}
 
 	/* Read frame type */
 	ret = tcpci_read_reg8(&cfg->bus, TCPC_REG_RX_BUFFER + 1, &rxftype);
 	if (ret) {
+		k_mutex_unlock(&data->bus_lock);
 		return ret;
 	}
 
 	/* Read PD header (2 bytes) */
 	ret = tcpci_read_reg16(&cfg->bus, TCPC_REG_RX_BUFFER + 2, &rxhead);
 	if (ret) {
+		k_mutex_unlock(&data->bus_lock);
 		return ret;
 	}
 
@@ -439,6 +517,7 @@ static int raa489400_get_rx_pending_msg(const struct device *dev,
 		LOG_WRN("Invalid RX byte count %d", rxbcnt);
 		tcpci_write_reg8(&cfg->bus, TCPC_REG_COMMAND,
 				 TCPC_REG_COMMAND_RESET_RECEIVE_BUF);
+		k_mutex_unlock(&data->bus_lock);
 		return -EMSGSIZE;
 	}
 
@@ -459,6 +538,7 @@ static int raa489400_get_rx_pending_msg(const struct device *dev,
 					rx_data_size);
 		if (ret) {
 			LOG_ERR("Failed to read Rx data: %d", ret);
+			k_mutex_unlock(&data->bus_lock);
 			return ret;
 		}
 	}
@@ -467,6 +547,7 @@ static int raa489400_get_rx_pending_msg(const struct device *dev,
 	tcpci_write_reg16(&cfg->bus, TCPC_REG_ALERT, TCPC_REG_ALERT_RX_STATUS);
 
 	data->msg_pending = false;
+	k_mutex_unlock(&data->bus_lock);
 	return 0;
 }
 
@@ -480,9 +561,14 @@ static int raa489400_transmit_data(const struct device *dev,
 				   struct pd_msg *msg)
 {
 	const struct raa489400_cfg *cfg = dev->config;
+	struct raa489400_data *data = dev->data;
+	int ret;
 
 	/* 3 retries per USB PD specification */
-	return tcpci_tcpm_transmit_data(&cfg->bus, msg, 3);
+	k_mutex_lock(&data->bus_lock, K_FOREVER);
+	ret = tcpci_tcpm_transmit_data(&cfg->bus, msg, 3);
+	k_mutex_unlock(&data->bus_lock);
+	return ret;
 }
 
 /* ================================================================
@@ -496,14 +582,20 @@ static int raa489400_get_status_register(const struct device *dev,
 					 uint32_t *status)
 {
 	const struct raa489400_cfg *cfg = dev->config;
+	struct raa489400_data *data = dev->data;
+	int ret;
 
+	k_mutex_lock(&data->bus_lock, K_FOREVER);
 	if (reg == TCPC_VENDOR_DEFINED_STATUS) {
-		return tcpci_read_reg16(&cfg->bus,
-					RAA489400_REG_VENDOR_STATUS,
-					(uint16_t *)status);
+		ret = tcpci_read_reg16(&cfg->bus,
+				       RAA489400_REG_VENDOR_STATUS,
+				       (uint16_t *)status);
+	} else {
+		ret = tcpci_tcpm_get_status_register(&cfg->bus, reg,
+						     (uint16_t *)status);
 	}
-	return tcpci_tcpm_get_status_register(&cfg->bus, reg,
-					      (uint16_t *)status);
+	k_mutex_unlock(&data->bus_lock);
+	return ret;
 }
 
 /* ================================================================
@@ -587,13 +679,33 @@ static void raa489400_alert_work_handler(struct k_work *work)
 	const struct device *dev = data->dev;
 	const struct raa489400_cfg *cfg = dev->config;
 	uint16_t alert_reg;
+	uint16_t serviced;
 	int ret;
+
+	/* Do not touch the bus until init has fully completed, or this
+	 * handler's I2C will collide with init's own I2C traffic. */
+	if (!data->initialized) {
+		return;
+	}
+
+	/* Serialize against the USB-C stack thread's TCPC calls. k_mutex is
+	 * recursive, so the synchronous data->alert_handler() callbacks
+	 * below (which re-enter this driver's locked API functions on the
+	 * same thread) are safe. */
+	k_mutex_lock(&data->bus_lock, K_FOREVER);
 
 	/* Read the ALERT register */
 	ret = tcpci_read_reg16(&cfg->bus, TCPC_REG_ALERT, &alert_reg);
 	if (ret || alert_reg == 0) {
+		k_mutex_unlock(&data->bus_lock);
 		return;
 	}
+
+	/* Remember what we saw this pass, so the re-drain below can tell a
+	 * genuinely new event apart from a persistent bit we already
+	 * serviced (a persistent bit must NOT trigger an immediate
+	 * resubmit, or the handler spins and starves the bus). */
+	serviced = alert_reg;
 
 	LOG_DBG("ALERT = 0x%04x", alert_reg);
 
@@ -649,9 +761,25 @@ static void raa489400_alert_work_handler(struct k_work *work)
 		case TCPC_ALERT_TRANSMIT_MSG_DISCARDED:
 			bit = TCPC_REG_ALERT_TX_COMPLETE;
 			break;
-		case TCPC_ALERT_FAULT_STATUS:
+		case TCPC_ALERT_FAULT_STATUS: {
+			/* The FAULT alert bit only re-arms when the underlying
+			 * FAULT_STATUS (0x1F) condition is acknowledged. Read
+			 * it, log it once, and W1C-clear it at the source —
+			 * otherwise the fault re-asserts ALERT immediately and
+			 * the handler spins forever, starving the I2C bus. */
+			uint8_t fault = 0;
+
+			tcpci_read_reg8(&cfg->bus,
+					RAA489400_REG_FAULT_STATUS, &fault);
+			LOG_WRN("FAULT_STATUS = 0x%02x", fault);
+			if (fault) {
+				tcpci_write_reg8(&cfg->bus,
+						 RAA489400_REG_FAULT_STATUS,
+						 fault);
+			}
 			bit = TCPC_REG_ALERT_FAULT;
 			break;
+		}
 		case TCPC_ALERT_VBUS_SNK_DISCONNECT:
 			bit = TCPC_REG_ALERT_VBUS_DISCNCT;
 			break;
@@ -673,6 +801,24 @@ static void raa489400_alert_work_handler(struct k_work *work)
 					    alert);
 		}
 	}
+
+	/* Level-triggered drain: ALERT# stays asserted (low) while any
+	 * unmasked event is still pending. With an edge interrupt, an
+	 * alert that arrived while we were servicing this pass produces no
+	 * new falling edge, so re-check and re-submit — but ONLY if a bit
+	 * we did not already service this pass is now set. A persistent
+	 * bit that we just serviced (e.g. an un-clearable fault condition)
+	 * must not trigger another resubmit, or the handler spins forever
+	 * and starves the shared I2C bus. */
+	if (tcpci_read_reg16(&cfg->bus, TCPC_REG_ALERT, &alert_reg) == 0) {
+		if (alert_reg & ~serviced) {
+			k_mutex_unlock(&data->bus_lock);
+			k_work_submit(&data->alert_work);
+			return;
+		}
+	}
+
+	k_mutex_unlock(&data->bus_lock);
 }
 
 /* ================================================================

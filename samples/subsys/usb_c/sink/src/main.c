@@ -276,17 +276,17 @@ int main(void)
 {
 	const struct device *usbc_port0;
 
-	/* --- temporary I2C bus readiness check --- */
-	const struct device *i2c = DEVICE_DT_GET(DT_NODELABEL(iic1));
-	LOG_INF("iic1 ready: %d", device_is_ready(i2c));
+	// /* --- temporary I2C bus readiness check --- */
+	// const struct device *i2c = DEVICE_DT_GET(DT_NODELABEL(iic1));
+	// LOG_INF("iic1 ready: %d", device_is_ready(i2c));
 
-	const struct device *tcpc = DEVICE_DT_GET(DT_NODELABEL(raa489400_tcpc0));
-	LOG_INF("tcpc ready: %d", device_is_ready(tcpc));
+	// const struct device *tcpc = DEVICE_DT_GET(DT_NODELABEL(raa489400_tcpc0));
+	// LOG_INF("tcpc ready: %d", device_is_ready(tcpc));
 
-	struct tcpc_chip_info info;
-	int r = tcpc_get_chip_info(tcpc, &info);
-	LOG_INF("chip_info ret=%d vendor=0x%04x product=0x%04x",
-		r, info.vendor_id, info.product_id);
+	// struct tcpc_chip_info info;
+	// int r = tcpc_get_chip_info(tcpc, &info);
+	// LOG_INF("chip_info ret=%d vendor=0x%04x product=0x%04x",
+	// 	r, info.vendor_id, info.product_id);
 
 	/* ----------------------------------------- */
 	/* Get the device for this port */

@@ -94,7 +94,8 @@
 	status = "okay";
 	pinctrl-0 = <&iic1_default>;
 	pinctrl-names = "default";
-	clock-frequency = <I2C_BITRATE_FAST>;   /* 400 kHz */
+	/*clock-frequency = <I2C_BITRATE_FAST>;    400 kHz */
+	clock-frequency = <I2C_BITRATE_STANDARD>;   /* 100 kHz */  
 	#address-cells = <1>;
 	#size-cells = <0>;
 	interrupts = <43 1>, <44 1>, <45 1>, <46 1>;

@@ -233,16 +233,8 @@ static int i2c_ra_iic_transfer(const struct device *dev, struct i2c_msg *msgs, u
 		addr_mode = I2C_MASTER_ADDR_MODE_7BIT;
 	}
 
-	// LOG_ERR("before address: open=0x%08x BBSY=%u",
-    //     data->control_ctrl.open,
-    //     data->control_ctrl.p_reg->ICCR2_b.BBSY);
-
 	fsp_err = R_IIC_MASTER_SlaveAddressSet(&data->control_ctrl, addr, addr_mode);
-	// LOG_ERR("SlaveAddressSet addr=0x%02x ret=%d open=0x%08x",
-    //     addr, fsp_err, data->control_ctrl.open);
-	// LOG_ERR("after address: ret=%d BBSY=%u",
-    //     fsp_err,
-    //     data->control_ctrl.p_reg->ICCR2_b.BBSY);
+
 	if (fsp_err != FSP_SUCCESS) {
    		ret = -EIO;
     	goto RELEASE_BUS;
@@ -259,24 +251,6 @@ static int i2c_ra_iic_transfer(const struct device *dev, struct i2c_msg *msgs, u
 			next = NULL;
 		}
 #if 1	
-    	// LOG_DBG("msg=%d flags=0x%x len=%u event=%d open=%u",
-        //     msg_idx, current->flags, current->len,
-        //     data->ctrl_event, data->control_ctrl.open);
-		// LOG_ERR("before address: open=0x%08x BBSY=%u",
-        // 	data->control_ctrl.open,
-        // 	data->control_ctrl.p_reg->ICCR2_b.BBSY);
-		// bool restart_after =
-    	// next != NULL && (next->flags & I2C_MSG_RESTART);
-
-		// LOG_ERR("msg=%d op=%s flags=0x%x len=%u "
-        // 	"next_flags=0x%x restart_after=%d BBSY=%u",
-        // 	msg_idx,
-        // 	(current->flags & I2C_MSG_READ) ? "read" : "write",
-        // 	current->flags,
-        // 	current->len,
-        // 	next ? next->flags : 0,
-        // 	restart_after,
-        // 	data->control_ctrl.p_reg->ICCR2_b.BBSY);
 
 		if (current->flags & I2C_MSG_READ) {
 			fsp_err =
@@ -293,22 +267,6 @@ static int i2c_ra_iic_transfer(const struct device *dev, struct i2c_msg *msgs, u
                 msg_idx,
                 (current->flags & I2C_MSG_READ) ? "read" : "write",
                 fsp_err);
-			// switch (fsp_err) {
-			// case FSP_ERR_INVALID_SIZE:
-			// 	LOG_ERR("%s: Provided number of bytes more than uint16_t size "
-			// 		"(65535) while DTC is used for data transfer.",
-			// 		__func__);
-			// 	break;
-			// case FSP_ERR_IN_USE:
-			// 	LOG_ERR("%s: Bus busy condition. Another transfer was in progress.",
-			// 		__func__);
-			// 	break;
-			// default:
-			// 	/* Should not reach here. */
-			// 	LOG_ERR("%s: Unknown error. FSP_ERR=%d\n", __func__, fsp_err);
-			// 	break;
-			// }
-
 			ret = -EIO;
 			goto RELEASE_BUS;
 		}
@@ -317,52 +275,7 @@ static int i2c_ra_iic_transfer(const struct device *dev, struct i2c_msg *msgs, u
 		LOG_DBG("msg=%d callback event=%d",
             msg_idx, data->ctrl_event);
 #else
-retry_xfer:
-		if (current->flags & I2C_MSG_READ) {
-			fsp_err =
-				R_IIC_MASTER_Read(&data->control_ctrl, current->buf, current->len,
-						  next != NULL && (next->flags & I2C_MSG_RESTART));
-		} else {
-			fsp_err =
-				R_IIC_MASTER_Write(&data->control_ctrl, current->buf, current->len,
-						   next != NULL && (next->flags & I2C_MSG_RESTART));
-		}
-		if (fsp_err == FSP_ERR_IN_USE && attempts++ < 8) {
-			/* Peripheral left busy by a prior aborted transfer.
-			 * Force it back to ready and retry.
-			 */
-			R_IIC_MASTER_Abort(&data->control_ctrl);
-			k_msleep(1);
-			goto retry_xfer;
-		}
-		if (fsp_err != FSP_SUCCESS) {
-			switch (fsp_err) {
-			case FSP_ERR_INVALID_SIZE:
-				LOG_ERR("%s: Provided number of bytes more than uint16_t size "
-					"(65535) while DTC is used for data transfer.",
-					__func__);
-				break;
-			case FSP_ERR_IN_USE:
-				LOG_ERR("%s: Bus busy condition. Another transfer was in progress.",
-					__func__);
-				break;
-			default:
-				/* Should not reach here. */
-				LOG_ERR("%s: Unknown error. FSP_ERR=%d\n", __func__, fsp_err);
-				break;
-			}
 
-			ret = -EIO;
-			goto RELEASE_BUS;
-		}
-		/* Wait for callback, but with a timeout so an aborted transfer
-		 * that never calls back can't block forever.
-		 */
-		if (k_sem_take(&data->complete_sem, K_MSEC(50)) != 0) {
-			R_IIC_MASTER_Abort(&data->control_ctrl);
-			ret = -EIO;
-			goto RELEASE_BUS;
-		}
 #endif
 
 		/* Handle event msg from callback. */

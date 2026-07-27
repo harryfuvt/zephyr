@@ -44,6 +44,35 @@
 LOG_MODULE_REGISTER(raa489400, CONFIG_USBC_LOG_LEVEL);
 
 /* ----------------------------------------------------------------
+ * Board VBUS-path / GPIO configuration
+ *
+ * Taken verbatim (bit-for-bit) from the verified bare-metal driver
+ * that was validated on the RAA489400 evaluation board. On this
+ * board the VBUS SINK power switch is driven through GPIO1, so GPIO1
+ * must be a push-pull output-enable, GPIO2 an input, and the VBUS
+ * path steered to GPIO1 with the sink switch enabled. Without this
+ * the sink FET is never in circuit and no stable power contract can
+ * form even though CC detection and I2C work.
+ *
+ * These bit definitions are not in raa489400.h (read-only), so they
+ * are reproduced here with the datasheet register/section numbers.
+ * ---------------------------------------------------------------- */
+/* 7.2.41 GPIOx_CTRL (82h/83h) */
+#define RAA_GPIO_IE        (1 << 4)   /* input enable                 */
+#define RAA_GPIO_PP        (1 << 3)   /* output push-pull             */
+#define RAA_GPIO_OE        (1 << 2)   /* output enable (pin=GPIO_O)   */
+/* 7.2.46 VBUS_GPIO_CTRL (87h) */
+#define RAA_VBUS_GPIO_EN_SNK   (1 << 1)   /* loaded to GPIOn_O for sink */
+
+/* Concrete values written during init (see raa489400_board_vbus_init) */
+#define RAA_GPIO1_CTRL_VAL     (RAA_GPIO_PP | RAA_GPIO_OE)              /* 0x0C */
+#define RAA_GPIO2_CTRL_VAL     (RAA_GPIO_IE)                           /* 0x10 */
+#define RAA_VBUS_PATH_CTRL_VAL (RAA489400_VBUS_PATH_SNK_SEL_GPIO1 | \
+				RAA489400_VBUS_PATH_SNK_EN)           /* 0x03 */
+#define RAA_VBUS_GPIO_CTRL_VAL (RAA_VBUS_GPIO_EN_SNK)                  /* 0x02 */
+
+
+/* ----------------------------------------------------------------
  * Driver config — compile-time, from devicetree
  * ---------------------------------------------------------------- */
 struct raa489400_cfg {
@@ -93,6 +122,21 @@ static void raa489400_alert_gpio_cb(const struct device *port,
 				    struct gpio_callback *cb,
 				    gpio_port_pins_t pins);
 
+
+static int raa489400_tcpc_init(const struct device *dev)
+{
+	struct raa489400_data *data = dev->data;
+
+	if (!data->initialized) {
+		// if (data->init_retries > CONFIG_USBC_TCPC_PS8XXX_INIT_RETRIES) {
+		// 	LOG_ERR("TCPC was not initialized correctly");
+		// 	return -EIO;
+		// }
+		return -EAGAIN;
+	}
+	LOG_INF("RAA489400 TCPC already initialized");
+	return 0;
+}
 /* ================================================================
  * Vendor-specific helpers (use tcpci_priv directly)
  * ================================================================ */
@@ -147,6 +191,46 @@ static int raa489400_vendor_init(const struct device *dev)
 }
 
 /* ================================================================
+ * Board VBUS-path / GPIO static configuration
+ *
+ * Mirrors "Phase 1: Static configuration" of the verified bare-metal
+ * tcpci_init(). Must run once after the chip is identified and vendor
+ * registers are applied, before attach detection begins.
+ * ================================================================ */
+static int raa489400_board_vbus_init(const struct device *dev)
+{
+	const struct raa489400_cfg *cfg = dev->config;
+	int ret;
+
+	ret = tcpci_write_reg8(&cfg->bus, RAA489400_REG_GPIO1_CTRL,
+			       RAA_GPIO1_CTRL_VAL);
+	if (ret) {
+		return ret;
+	}
+	ret = tcpci_write_reg8(&cfg->bus, RAA489400_REG_GPIO2_CTRL,
+			       RAA_GPIO2_CTRL_VAL);
+	if (ret) {
+		return ret;
+	}
+	ret = tcpci_write_reg8(&cfg->bus, RAA489400_REG_VBUS_PATH_CTRL,
+			       RAA_VBUS_PATH_CTRL_VAL);
+	if (ret) {
+		return ret;
+	}
+	ret = tcpci_write_reg8(&cfg->bus, RAA489400_REG_VBUS_GPIO_CTRL,
+			       RAA_VBUS_GPIO_CTRL_VAL);
+	if (ret) {
+		return ret;
+	}
+
+	LOG_DBG("VBUS sink path configured via GPIO1 "
+		"(GPIO1=0x%02x PATH=0x%02x GPIO_CTRL=0x%02x)",
+		RAA_GPIO1_CTRL_VAL, RAA_VBUS_PATH_CTRL_VAL,
+		RAA_VBUS_GPIO_CTRL_VAL);
+	return 0;
+}
+
+/* ================================================================
  * tcpc_driver_api: init
  * ================================================================ */
 static int raa489400_init(const struct device *dev)
@@ -156,14 +240,6 @@ static int raa489400_init(const struct device *dev)
 	uint8_t pwr_status;
 	int ret;
 
-    if (data->initialized) {
-        LOG_DBG("RAA489400 already initialized");
-        return 0;
-    }
-
-	k_mutex_init(&data->bus_lock);
-	k_work_init(&data->alert_work, raa489400_alert_work_handler);
-	
 	/* 1. Verify I2C bus is ready */
 	if (!i2c_is_ready_dt(&cfg->bus)) {
 		LOG_ERR("I2C bus not ready");
@@ -201,6 +277,14 @@ static int raa489400_init(const struct device *dev)
 	if (ret) {
 		return ret;
 	}
+
+	/* 4a. Board VBUS-path / GPIO static config (verified bare-metal
+	 *     Phase 1). On this eval board the sink FET is driven via
+	 *     GPIO1; without this the power path is never in circuit. */
+	// ret = raa489400_board_vbus_init(dev);
+	// if (ret) {
+	// 	return ret;
+	// }
 
 	/* 5. Enable VBUS detection */
 	ret = tcpci_write_reg8(&cfg->bus,
@@ -254,8 +338,8 @@ static int raa489400_init(const struct device *dev)
 
 	/* 8. Configure ALERT# GPIO interrupt (active-low falling edge) */
 	data->dev = dev;
-	// k_mutex_init(&data->bus_lock);
-	// k_work_init(&data->alert_work, raa489400_alert_work_handler);
+	k_mutex_init(&data->bus_lock);
+	k_work_init(&data->alert_work, raa489400_alert_work_handler);
 
 	ret = gpio_pin_configure_dt(&cfg->alert_gpio, GPIO_INPUT);
 	if (ret) {
@@ -469,88 +553,326 @@ static int raa489400_set_rx_enable(const struct device *dev, bool enable)
  * Delegates to tcpci_tcpm_get_rx_pending_msg() which reads the
  * RX buffer (READABLE_BYTE_COUNT + RX_BUF_FRAME_TYPE + payload).
  * ================================================================ */
+// static int raa489400_get_rx_pending_msg(const struct device *dev,
+// 					struct pd_msg *msg)
+// {
+// 	const struct raa489400_cfg *cfg = dev->config;
+// 	struct raa489400_data *data = dev->data;
+// 	uint8_t rxbcnt;    /* READABLE_BYTE_COUNT  */
+// 	uint8_t rxftype;   /* RX_BUF_FRAME_TYPE    */
+// 	uint16_t rxhead;   /* first two payload bytes = PD header */
+// 	int rx_data_size;
+// 	int ret;
+
+// 	k_mutex_lock(&data->bus_lock, K_FOREVER);
+
+// 	/* ── Read the RX buffer at register TCPC_REG_RX_BUFFER (0x30) ──
+// 	 * TCPCi Rev2.0 layout (single I2C burst from 0x30):
+// 	 *   Byte 0: READABLE_BYTE_COUNT  = M + 2
+// 	 *   Byte 1: RX_BUF_FRAME_TYPE
+// 	 *   Bytes 2-3: PD message header (RX_BUF_BYTE_0, RX_BUF_BYTE_1)
+// 	 *   Bytes 4..M+1: PD data objects
+// 	 * ─────────────────────────────────────────────────────────── */
+
+// 	/* Read byte count */
+// 	ret = tcpci_read_reg8(&cfg->bus, TCPC_REG_RX_BUFFER, &rxbcnt);
+// 	if (ret) {
+// 		k_mutex_unlock(&data->bus_lock);
+// 		return ret;
+// 	}
+
+// 	/* Read frame type */
+// 	ret = tcpci_read_reg8(&cfg->bus, TCPC_REG_RX_BUFFER + 1, &rxftype);
+// 	if (ret) {
+// 		k_mutex_unlock(&data->bus_lock);
+// 		return ret;
+// 	}
+
+// 	/* Read PD header (2 bytes) */
+// 	ret = tcpci_read_reg16(&cfg->bus, TCPC_REG_RX_BUFFER + 2, &rxhead);
+// 	if (ret) {
+// 		k_mutex_unlock(&data->bus_lock);
+// 		return ret;
+// 	}
+
+// 	/* Data objects size = total bytes - header(2) - frame_type(1) - byte_cnt(1) */
+// 	rx_data_size = rxbcnt - 3;
+// 	if (rx_data_size < 0 || rx_data_size > (int)sizeof(msg->data)) {
+// 		LOG_WRN("Invalid RX byte count %d", rxbcnt);
+// 		tcpci_write_reg8(&cfg->bus, TCPC_REG_COMMAND,
+// 				 TCPC_REG_COMMAND_RESET_RECEIVE_BUF);
+// 		k_mutex_unlock(&data->bus_lock);
+// 		return -EMSGSIZE;
+// 	}
+
+// 	/* Rx frame type */
+// 	msg->type = rxftype;
+
+// 	/* Rx header */
+// 	msg->header.raw_value = (uint16_t)rxhead;
+
+// 	/* Rx data size */
+// 	msg->len = rx_data_size;
+
+// 	/* Rx data objects — burst read starting at offset +4 from TCPC_REG_RX_BUFFER */
+// 	if (rx_data_size > 0) {
+// 		ret = i2c_burst_read_dt(&cfg->bus,
+// 					TCPC_REG_RX_BUFFER + 4,
+// 					msg->data,
+// 					rx_data_size);
+// 		if (ret) {
+// 			LOG_ERR("Failed to read Rx data: %d", ret);
+// 			k_mutex_unlock(&data->bus_lock);
+// 			return ret;
+// 		}
+// 	}
+
+// 	/* Clear RX_STATUS alert bit (W1C) */
+// 	tcpci_write_reg16(&cfg->bus, TCPC_REG_ALERT, TCPC_REG_ALERT_RX_STATUS);
+
+// 	data->msg_pending = false;
+// 	k_mutex_unlock(&data->bus_lock);
+// 	return 0;
+// }
+
+/*
+ * Read and decode the TCPCI receive buffer beginning at 0x30.
+ * This Zephyr revision does not provide a
+ * tcpci_tcpm_get_rx_pending_msg() helper.
+ */
+// #include <zephyr/sys/byteorder.h>
+// #include <string.h>
+
+// static int raa489400_get_rx_pending_msg(const struct device *dev,
+//                     struct pd_msg *msg)
+// {
+//     const struct raa489400_cfg *cfg = dev->config;
+//     struct raa489400_data *data = dev->data;
+//     uint8_t buf[4 + sizeof(msg->data)];
+//     uint8_t byte_count;
+//     size_t transfer_size;
+//     size_t data_size;
+//     int ret;
+
+//     k_mutex_lock(&data->bus_lock, K_FOREVER);
+//     if (!data->msg_pending) {
+//         ret = -ENODATA;
+//         goto out;
+//     }
+//     /*
+//      * TCPCI RX buffer:
+//      *
+//      * 0x30: READABLE_BYTE_COUNT
+//      * 0x31: RX_BUF_FRAME_TYPE
+//      * 0x32: PD header byte 0
+//      * 0x33: PD header byte 1
+//      * 0x34: first data-object byte
+//      *
+//      * READABLE_BYTE_COUNT covers:
+//      *   frame type + 2-byte PD header + PD data bytes.
+//      */
+//     ret = tcpci_read_reg8(&cfg->bus, TCPC_REG_RX_BUFFER,
+//                   &byte_count);
+//     if (ret != 0) {
+//         LOG_ERR("Failed to read RX byte count: %d", ret);
+//         goto out;
+//     }
+
+//     if (byte_count < 3U ||
+//         byte_count > (3U + sizeof(msg->data))) {
+//         LOG_ERR("Invalid RX byte count: %u", byte_count);
+
+//         (void)tcpci_write_reg8(
+//             &cfg->bus,
+//             TCPC_REG_COMMAND,
+//             TCPC_REG_COMMAND_RESET_RECEIVE_BUF);
+
+//         ret = -EMSGSIZE;
+//         goto out;
+//     }
+
+//     /*
+//      * Include the READABLE_BYTE_COUNT byte itself.
+//      */
+//     transfer_size = (size_t)byte_count + 1U;
+
+//     /*
+//      * Read the complete RX message from 0x30 in one burst. This
+//      * avoids separately reading frame type, header, and payload.
+//      */
+//     ret = i2c_burst_read_dt(&cfg->bus, TCPC_REG_RX_BUFFER,
+//                 buf, transfer_size);
+//     if (ret != 0) {
+//         LOG_ERR("Failed to burst-read RX buffer: %d", ret);
+//         goto out;
+//     }
+
+//     /*
+//      * Verify that the count did not change between the count read
+//      * and the complete buffer read.
+//      */
+//     if (buf[0] != byte_count) {
+//         LOG_WRN("RX byte count changed: first=%u burst=%u",
+//             byte_count, buf[0]);
+//         ret = -EAGAIN;
+//         goto out;
+//     }
+
+//     data_size = (size_t)byte_count - 3U;
+
+//     msg->type = buf[1];
+//     msg->header.raw_value = sys_get_le16(&buf[2]);
+//     msg->len = data_size;
+
+//     if (data_size != 0U) {
+//         memcpy(msg->data, &buf[4], data_size);
+//     }
+
+//     data->msg_pending = false;
+
+//     LOG_DBG("RX: count=%u type=0x%02x header=0x%04x data=%u",
+//         byte_count, msg->type, msg->header.raw_value,
+//         (unsigned int)data_size);
+
+//     ret = 0;
+
+// out:
+//     k_mutex_unlock(&data->bus_lock);
+//     return ret;
+// }
+#include <zephyr/sys/byteorder.h>
+#include <string.h>
+
 static int raa489400_get_rx_pending_msg(const struct device *dev,
-					struct pd_msg *msg)
+                    struct pd_msg *msg)
 {
-	const struct raa489400_cfg *cfg = dev->config;
-	struct raa489400_data *data = dev->data;
-	uint8_t rxbcnt;    /* READABLE_BYTE_COUNT  */
-	uint8_t rxftype;   /* RX_BUF_FRAME_TYPE    */
-	uint16_t rxhead;   /* first two payload bytes = PD header */
-	int rx_data_size;
-	int ret;
+    const struct raa489400_cfg *cfg = dev->config;
+    struct raa489400_data *data = dev->data;
+    uint8_t buf[4 + sizeof(msg->data)];
+    uint8_t count;
+    size_t total;
+    size_t payload_len;
+    int ret;
 
-	k_mutex_lock(&data->bus_lock, K_FOREVER);
+    k_mutex_lock(&data->bus_lock, K_FOREVER);
 
-	/* ── Read the RX buffer at register TCPC_REG_RX_BUFFER (0x30) ──
-	 * TCPCi Rev2.0 layout (single I2C burst from 0x30):
-	 *   Byte 0: READABLE_BYTE_COUNT  = M + 2
-	 *   Byte 1: RX_BUF_FRAME_TYPE
-	 *   Bytes 2-3: PD message header (RX_BUF_BYTE_0, RX_BUF_BYTE_1)
-	 *   Bytes 4..M+1: PD data objects
-	 * ─────────────────────────────────────────────────────────── */
+    if (!data->msg_pending) {
+        ret = -ENODATA;
+        goto out;
+    }
 
-	/* Read byte count */
-	ret = tcpci_read_reg8(&cfg->bus, TCPC_REG_RX_BUFFER, &rxbcnt);
-	if (ret) {
-		k_mutex_unlock(&data->bus_lock);
-		return ret;
+    /*
+     * Read READABLE_BYTE_COUNT first. Do not clear RX_STATUS
+     * until the complete message has been copied.
+     */
+    ret = tcpci_read_reg8(&cfg->bus, TCPC_REG_RX_BUFFER, &count);
+    if (ret != 0) {
+        LOG_ERR("Failed to read RX byte count: %d", ret);
+        goto out;
+    }
+
+    /*
+     * Count includes:
+     *   RX_BUF_FRAME_TYPE: 1 byte
+     *   PD header:         2 bytes
+     *   payload:           0..28 bytes
+     */
+    if ((count < 3U) || (count > (3U + sizeof(msg->data)))) {
+        LOG_WRN("Invalid RX byte count: %u", count);
+
+        /*
+         * Discard the invalid RX buffer and acknowledge RX_STATUS,
+         * otherwise the stack may repeatedly request the same
+         * invalid message.
+         */
+        (void)tcpci_write_reg8(&cfg->bus,
+                      TCPC_REG_COMMAND,
+                      TCPC_REG_COMMAND_RESET_RECEIVE_BUF);
+
+        (void)tcpci_write_reg16(&cfg->bus,
+                       TCPC_REG_ALERT,
+                       TCPC_REG_ALERT_RX_STATUS);
+
+        data->msg_pending = false;
+        ret = -EBADMSG;
+        goto out;
+    }
+
+    /*
+     * Include the count byte itself:
+     *   buf[0] = count
+     *   buf[1] = frame type
+     *   buf[2..3] = header
+     *   buf[4..] = data objects
+     */
+    total = (size_t)count + 1U;
+
+    ret = i2c_burst_read_dt(&cfg->bus,
+                TCPC_REG_RX_BUFFER,
+                buf,
+                total);
+    if (ret != 0) {
+        LOG_ERR("Failed to read RX buffer: %d", ret);
+        goto out;
+    }
+
+    if (buf[0] != count) {
+        LOG_WRN("RX count changed: initial=%u burst=%u",
+            count, buf[0]);
+        ret = -EAGAIN;
+        goto out;
+    }
+
+    payload_len = (size_t)count - 3U;
+
+    msg->type = buf[1];
+    msg->header.raw_value = sys_get_le16(&buf[2]);
+    msg->len = payload_len;
+
+    if (payload_len != 0U) {
+        memcpy(msg->data, &buf[4], payload_len);
+    }
+
+    // LOG_INF("RX count=%u type=0x%02x header=0x%04x payload=%u",
+    //     count, msg->type, msg->header.raw_value,
+    //     (unsigned int)payload_len);
+	LOG_INF("RX count=%u type=0x%02x header=0x%04x payload=%u PDO0=0x%08x",
+		count,
+		msg->type,
+		msg->header.raw_value,
+		(unsigned int)payload_len,
+		payload_len >= 4U ? msg->data[0] : 0U);
+
+	uint8_t ndo = (msg->header.raw_value >> 12) & 0x7U;
+
+	if ((size_t)ndo * sizeof(uint32_t) != payload_len) {
+		LOG_ERR("RX length mismatch: NDO=%u payload=%u",
+			ndo, (unsigned int)payload_len);
+		ret = -EBADMSG;
+		goto out;
 	}
+    /*
+     * Message has now been copied safely. Release the TCPC RX
+     * buffer by clearing RX_STATUS.
+     */
+    ret = tcpci_write_reg16(&cfg->bus,
+                TCPC_REG_ALERT,
+                TCPC_REG_ALERT_RX_STATUS);
+    if (ret != 0) {
+        LOG_ERR("Failed to clear RX_STATUS: %d", ret);
+        goto out;
+    }
 
-	/* Read frame type */
-	ret = tcpci_read_reg8(&cfg->bus, TCPC_REG_RX_BUFFER + 1, &rxftype);
-	if (ret) {
-		k_mutex_unlock(&data->bus_lock);
-		return ret;
-	}
-
-	/* Read PD header (2 bytes) */
-	ret = tcpci_read_reg16(&cfg->bus, TCPC_REG_RX_BUFFER + 2, &rxhead);
-	if (ret) {
-		k_mutex_unlock(&data->bus_lock);
-		return ret;
-	}
-
-	/* Data objects size = total bytes - header(2) - frame_type(1) - byte_cnt(1) */
-	rx_data_size = rxbcnt - 3;
-	if (rx_data_size < 0 || rx_data_size > (int)sizeof(msg->data)) {
-		LOG_WRN("Invalid RX byte count %d", rxbcnt);
-		tcpci_write_reg8(&cfg->bus, TCPC_REG_COMMAND,
-				 TCPC_REG_COMMAND_RESET_RECEIVE_BUF);
-		k_mutex_unlock(&data->bus_lock);
-		return -EMSGSIZE;
-	}
-
-	/* Rx frame type */
-	msg->type = rxftype;
-
-	/* Rx header */
-	msg->header.raw_value = (uint16_t)rxhead;
-
-	/* Rx data size */
-	msg->len = rx_data_size;
-
-	/* Rx data objects — burst read starting at offset +4 from TCPC_REG_RX_BUFFER */
-	if (rx_data_size > 0) {
-		ret = i2c_burst_read_dt(&cfg->bus,
-					TCPC_REG_RX_BUFFER + 4,
-					msg->data,
-					rx_data_size);
-		if (ret) {
-			LOG_ERR("Failed to read Rx data: %d", ret);
-			k_mutex_unlock(&data->bus_lock);
-			return ret;
-		}
-	}
-
-	/* Clear RX_STATUS alert bit (W1C) */
-	tcpci_write_reg16(&cfg->bus, TCPC_REG_ALERT, TCPC_REG_ALERT_RX_STATUS);
-
+	LOG_INF("RX returning success: type=0x%02x header=0x%04x len=%u",
+		msg->type, msg->header.raw_value, msg->len);
+	
 	data->msg_pending = false;
-	k_mutex_unlock(&data->bus_lock);
-	return 0;
-}
+	ret = 0;
 
+out:
+    k_mutex_unlock(&data->bus_lock);
+    return ret;
+}
 /* ================================================================
  * tcpc_driver_api: transmit_data
  *
@@ -563,6 +885,9 @@ static int raa489400_transmit_data(const struct device *dev,
 	const struct raa489400_cfg *cfg = dev->config;
 	struct raa489400_data *data = dev->data;
 	int ret;
+
+    LOG_INF("TX request: type=0x%02x header=0x%04x len=%u",
+        msg->type, msg->header.raw_value, msg->len);
 
 	/* 3 retries per USB PD specification */
 	k_mutex_lock(&data->bus_lock, K_FOREVER);
@@ -749,10 +1074,24 @@ static void raa489400_alert_work_handler(struct k_work *work)
 			bit = TCPC_REG_ALERT_POWER_STATUS;
 			break;
 		}
+		// case TCPC_ALERT_MSG_STATUS:
+		// 	bit = TCPC_REG_ALERT_RX_STATUS;
+		// 	data->msg_pending = true;
+		// 	break;
 		case TCPC_ALERT_MSG_STATUS:
-			bit = TCPC_REG_ALERT_RX_STATUS;
+			/*
+			* Do not clear RX_STATUS here. Clearing it may release the
+			* TCPC RX buffer before get_rx_pending_msg() reads it.
+			*/
 			data->msg_pending = true;
-			break;
+
+			if (data->alert_handler) {
+				data->alert_handler(dev, data->alert_handler_data,
+							TCPC_ALERT_MSG_STATUS);
+			}
+
+			alert_reg &= ~TCPC_REG_ALERT_RX_STATUS;
+    		continue;		
 		case TCPC_ALERT_HARD_RESET_RECEIVED:
 			bit = TCPC_REG_ALERT_RX_HARD_RST;
 			break;
@@ -1170,7 +1509,8 @@ static int raa489400_set_drp_toggle(const struct device *dev, bool enable)
  * ================================================================ */
 static const struct tcpc_driver_api raa489400_driver_api = {
 	/* Matches struct tcpc_driver_api in usbc_tcpc.h exactly */
-	.init                   = raa489400_init,
+	// .init                   = raa489400_init,
+	.init                   = raa489400_tcpc_init,
 	.get_cc                 = raa489400_get_cc,
 	.select_rp_value        = raa489400_select_rp_value,
 	.get_rp_value           = raa489400_get_rp_value,

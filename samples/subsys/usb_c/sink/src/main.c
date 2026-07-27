@@ -171,7 +171,7 @@ static void port0_policy_cb_set_src_cap(const struct device *dev, const uint32_t
 	struct port0_data_t *dpm_data;
 	int num;
 	int i;
-
+ 	LOG_INF("set_src_cap called, num_pdos=%d", num_pdos);
 	dpm_data = usbc_get_dpm_data(dev);
 
 	num = num_pdos;
@@ -181,6 +181,7 @@ static void port0_policy_cb_set_src_cap(const struct device *dev, const uint32_t
 
 	for (i = 0; i < num; i++) {
 		dpm_data->src_caps[i] = *(pdos + i);
+		LOG_INF("Source PDO[%d] = 0x%08x", i, pdos[i]);
 	}
 
 	dpm_data->src_cap_cnt = num;
@@ -189,8 +190,11 @@ static void port0_policy_cb_set_src_cap(const struct device *dev, const uint32_t
 static uint32_t port0_policy_cb_get_rdo(const struct device *dev)
 {
 	struct port0_data_t *dpm_data = usbc_get_dpm_data(dev);
+	// return build_rdo(dpm_data);
+	uint32_t rdo = build_rdo(dpm_data);
 
-	return build_rdo(dpm_data);
+    LOG_INF("get_rdo called, RDO=0x%08x", rdo);
+    return rdo;
 }
 /* usbc.rst callbacks end */
 
@@ -201,8 +205,10 @@ static void port0_notify(const struct device *dev, const enum usbc_policy_notify
 
 	switch (policy_notify) {
 	case PROTOCOL_ERROR:
+    	LOG_ERR("PROTOCOL_ERROR");	
 		break;
 	case MSG_DISCARDED:
+		LOG_WRN("MSG_DISCARDED");
 		break;
 	case MSG_ACCEPT_RECEIVED:
 		break;
@@ -239,10 +245,13 @@ static void port0_notify(const struct device *dev, const enum usbc_policy_notify
 	case SNK_TRANSITION_TO_DEFAULT:
 		break;
 	case HARD_RESET_RECEIVED:
+		LOG_WRN("HARD_RESET_RECEIVED");
 		break;
 	case SENDER_RESPONSE_TIMEOUT:
+	    LOG_WRN("SENDER_RESPONSE_TIMEOUT");
 		break;
 	case SOURCE_CAPABILITIES_RECEIVED:
+	    LOG_INF("SOURCE_CAPABILITIES_RECEIVED");
 		break;
 	default:
 	}

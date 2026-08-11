@@ -13,6 +13,10 @@
 
 #include <zephyr/drivers/usb_c/usbc_tcpc.h>
 
+#include <zephyr/drivers/usb_c/tcpci_priv.h>
+#include <zephyr/drivers/i2c.h>
+#define ROLE_CONTROL_REG 0x1A
+
 LOG_MODULE_REGISTER(main, LOG_LEVEL_DBG);
 
 #define USBC_PORT0_NODE DT_ALIAS(usbc_port0)
@@ -330,6 +334,35 @@ int main(void)
 	/* Start the USB-C Subsystem */
 	usbc_start(usbc_port0);
 	/* usbc.rst usbc end */
+
+	uint8_t role;
+	int ret;
+	static const struct i2c_dt_spec tcpc_i2c =  I2C_DT_SPEC_GET(DT_NODELABEL(raa489400_tcpc0));
+
+	if (!i2c_is_ready_dt(&tcpc_i2c)) {
+		LOG_ERR("TCPC I2C bus is not ready");
+		return 0;
+	}
+
+	// ret = i2c_reg_read_byte_dt(&tcpc_i2c, ROLE_CONTROL_REG, &role);
+	// LOG_INF("ROLE_CONTROL initial: ret=%d value=0x%02x", ret, role);
+
+	// ret = i2c_reg_write_byte_dt(&tcpc_i2c, ROLE_CONTROL_REG, 0x0A);
+	// LOG_INF("ROLE_CONTROL write Rd/Rd 0x0A: ret=%d", ret);
+
+	// k_msleep(20);
+
+	// ret = i2c_reg_read_byte_dt(&tcpc_i2c, ROLE_CONTROL_REG, &role);
+	// LOG_INF("ROLE_CONTROL after 0x0A: ret=%d value=0x%02x",
+	// 	role, role);
+
+	// ret = i2c_reg_write_byte_dt(&tcpc_i2c, ROLE_CONTROL_REG, 0x0F);
+	// LOG_INF("ROLE_CONTROL write Open/Open 0x0F: ret=%d", ret);
+
+	// // k_msleep(1);
+
+	// ret = i2c_reg_read_byte_dt(&tcpc_i2c, ROLE_CONTROL_REG, &role);
+	// LOG_INF("ROLE_CONTROL after 0x0F: ret=%d value=0x%02x", ret, role);
 
 	while (1) {
 		/* Perform Application Specific functions */

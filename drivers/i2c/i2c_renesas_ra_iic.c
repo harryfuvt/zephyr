@@ -64,6 +64,7 @@ struct i2c_ra_iic_data {
 	struct k_mutex bus_mutex;
 	struct k_sem complete_sem;
 	uint32_t dev_config;
+	atomic_t callback_count;
 };
 
 /* IIC clock setting calculation function. */
@@ -166,143 +167,620 @@ static int i2c_ra_iic_get_config(const struct device *dev, uint32_t *dev_config)
 	return 0;
 }
 
-static int i2c_ra_iic_transfer(const struct device *dev, struct i2c_msg *msgs, uint8_t num_msgs,
-			       uint16_t addr)
+
+// static int i2c_ra_iic_transfer(const struct device *dev, struct i2c_msg *msgs, uint8_t num_msgs,
+// 			       uint16_t addr)
+// {
+// 	struct i2c_ra_iic_data *data = (struct i2c_ra_iic_data *const)dev->data;
+// 	struct i2c_msg *current, *next;
+// 	fsp_err_t fsp_err = FSP_SUCCESS;
+// 	int ret = 0;
+
+// 	/* Check for validity of all messages before transfer */
+// 	current = msgs;
+
+// 	/*
+// 	 * Set I2C_MSG_RESTART flag on first message in order to send start
+// 	 * condition
+// 	 */
+// 	current->flags |= I2C_MSG_RESTART;
+
+// 	for (int i = 1; i <= num_msgs; i++) {
+// 		if (i < num_msgs) {
+// 			next = current + 1;
+
+// 			/*
+// 			 * Restart condition between messages
+// 			 * of different directions is required
+// 			 */
+// 			if (OPERATION(current) != OPERATION(next)) {
+// 				if (!(next->flags & I2C_MSG_RESTART)) {
+// 					LOG_ERR("%s: Restart condition between messages of "
+// 						"different directions is required. Current/Total: "
+// 						"[%d/%d]",
+// 						__func__, i, num_msgs);
+// 					ret = -EIO;
+// 					break;
+// 				}
+// 			}
+
+// 			/* Stop condition is only allowed on last message */
+// 			if (current->flags & I2C_MSG_STOP) {
+// 				LOG_ERR("%s: Invalid stop flag. Stop condition is only allowed on "
+// 					"last message. Current/Total: [%d/%d]",
+// 					__func__, i, num_msgs);
+// 				ret = -EIO;
+// 				break;
+// 			}
+// 		} else {
+// 			current->flags |= I2C_MSG_STOP;
+// 		}
+
+// 		current++;
+// 	}
+
+// 	if (ret) {
+// 		return ret;
+// 	}
+
+// 	k_mutex_lock(&data->bus_mutex, K_FOREVER);
+
+// 	/* Set destination address with configured address mode before sending msg. */
+
+// 	i2c_master_addr_mode_t addr_mode = 0;
+
+// 	if (I2C_MSG_ADDR_10_BITS & data->dev_config) {
+// 		addr_mode = I2C_MASTER_ADDR_MODE_10BIT;
+// 	} else {
+// 		addr_mode = I2C_MASTER_ADDR_MODE_7BIT;
+// 	}
+
+// 	fsp_err = R_IIC_MASTER_SlaveAddressSet(&data->control_ctrl, addr, addr_mode);
+
+// 	if (fsp_err != FSP_SUCCESS) {
+//    		ret = -EIO;
+//     	goto RELEASE_BUS;
+// 	}
+// 	/* Process input `msgs`. */
+
+// 	current = msgs;
+// 	// int attempts = 0;
+// 	int msg_idx = 0;
+// 	while (num_msgs > 0) {
+// 		if (num_msgs > 1) {
+// 			next = current + 1;
+// 		} else {
+// 			next = NULL;
+// 		}
+// #if 1	
+
+// 		if (current->flags & I2C_MSG_READ) {
+// 			fsp_err =
+// 				R_IIC_MASTER_Read(&data->control_ctrl, current->buf, current->len,
+// 						  next != NULL && (next->flags & I2C_MSG_RESTART));
+// 		} else {
+// 			fsp_err =
+// 				R_IIC_MASTER_Write(&data->control_ctrl, current->buf, current->len,
+// 						   next != NULL && (next->flags & I2C_MSG_RESTART));
+// 		}
+
+// 		if (fsp_err != FSP_SUCCESS) {
+// 			LOG_ERR("msg=%d %s failed, FSP_ERR=%d",
+//                 msg_idx,
+//                 (current->flags & I2C_MSG_READ) ? "read" : "write",
+//                 fsp_err);
+// 			ret = -EIO;
+// 			goto RELEASE_BUS;
+// 		}
+// 		/* Wait for callback to return. */
+// 		k_sem_take(&data->complete_sem, K_FOREVER);
+// 		LOG_DBG("msg=%d callback event=%d",
+//             msg_idx, data->ctrl_event);
+// #else
+
+// #endif
+
+// 		/* Handle event msg from callback. */
+// 		switch (data->ctrl_event) {
+// 		case I2C_MASTER_EVENT_ABORTED:
+// 			LOG_ERR("%s: %s failed.", __func__,
+// 				(current->flags & I2C_MSG_READ) ? "Read" : "Write");
+// 			ret = -EIO;
+// 			goto RELEASE_BUS;
+// 		case I2C_MASTER_EVENT_RX_COMPLETE:
+// 			break;
+// 		case I2C_MASTER_EVENT_TX_COMPLETE:
+// 			break;
+// 		default:
+// 			break;
+// 		}
+
+// 		current++;
+// 		num_msgs--;
+// 		msg_idx++;
+// 	}
+
+// RELEASE_BUS:
+// 	k_mutex_unlock(&data->bus_mutex);
+
+// 	return ret;
+// }
+
+
+/*
+ * Maximum time to wait for an IIC message callback.
+ *
+ * This is deliberately much longer than a normal TCPCI register
+ * transaction but prevents a missing interrupt from blocking the
+ * calling thread forever.
+ */
+#define I2C_RA_IIC_CALLBACK_TIMEOUT_MS       50U
+
+/*
+ * Maximum time to wait for the physical I2C bus to become idle.
+ */
+#define I2C_RA_IIC_BUS_IDLE_TIMEOUT_US       5000U
+
+/*
+ * Number of times to retry the complete Zephyr I2C transaction after
+ * recovering the FSP controller. A value of 1 means:
+ *
+ *     initial attempt + one retry
+ */
+#define I2C_RA_IIC_RECOVERY_RETRIES          1U
+
+/*
+ * Allow the FSP state machine to finish transitioning after a
+ * repeated-start message callback.
+ */
+#define I2C_RA_IIC_RESTART_SETTLE_US         5U
+
+static int i2c_ra_iic_wait_bus_idle(struct i2c_ra_iic_data *data,
+                    uint32_t timeout_us)
 {
-	struct i2c_ra_iic_data *data = (struct i2c_ra_iic_data *const)dev->data;
-	struct i2c_msg *current, *next;
-	fsp_err_t fsp_err = FSP_SUCCESS;
-	int ret = 0;
+    while (timeout_us-- > 0U) {
+        if (data->control_ctrl.p_reg->ICCR2_b.BBSY == 0U) {
+            return 0;
+        }
 
-	/* Check for validity of all messages before transfer */
-	current = msgs;
+        k_busy_wait(1);
+    }
 
-	/*
-	 * Set I2C_MSG_RESTART flag on first message in order to send start
-	 * condition
-	 */
-	current->flags |= I2C_MSG_RESTART;
-
-	for (int i = 1; i <= num_msgs; i++) {
-		if (i < num_msgs) {
-			next = current + 1;
-
-			/*
-			 * Restart condition between messages
-			 * of different directions is required
-			 */
-			if (OPERATION(current) != OPERATION(next)) {
-				if (!(next->flags & I2C_MSG_RESTART)) {
-					LOG_ERR("%s: Restart condition between messages of "
-						"different directions is required. Current/Total: "
-						"[%d/%d]",
-						__func__, i, num_msgs);
-					ret = -EIO;
-					break;
-				}
-			}
-
-			/* Stop condition is only allowed on last message */
-			if (current->flags & I2C_MSG_STOP) {
-				LOG_ERR("%s: Invalid stop flag. Stop condition is only allowed on "
-					"last message. Current/Total: [%d/%d]",
-					__func__, i, num_msgs);
-				ret = -EIO;
-				break;
-			}
-		} else {
-			current->flags |= I2C_MSG_STOP;
-		}
-
-		current++;
-	}
-
-	if (ret) {
-		return ret;
-	}
-
-	k_mutex_lock(&data->bus_mutex, K_FOREVER);
-
-	/* Set destination address with configured address mode before sending msg. */
-
-	i2c_master_addr_mode_t addr_mode = 0;
-
-	if (I2C_MSG_ADDR_10_BITS & data->dev_config) {
-		addr_mode = I2C_MASTER_ADDR_MODE_10BIT;
-	} else {
-		addr_mode = I2C_MASTER_ADDR_MODE_7BIT;
-	}
-
-	fsp_err = R_IIC_MASTER_SlaveAddressSet(&data->control_ctrl, addr, addr_mode);
-
-	if (fsp_err != FSP_SUCCESS) {
-   		ret = -EIO;
-    	goto RELEASE_BUS;
-	}
-	/* Process input `msgs`. */
-
-	current = msgs;
-	// int attempts = 0;
-	int msg_idx = 0;
-	while (num_msgs > 0) {
-		if (num_msgs > 1) {
-			next = current + 1;
-		} else {
-			next = NULL;
-		}
-#if 1	
-
-		if (current->flags & I2C_MSG_READ) {
-			fsp_err =
-				R_IIC_MASTER_Read(&data->control_ctrl, current->buf, current->len,
-						  next != NULL && (next->flags & I2C_MSG_RESTART));
-		} else {
-			fsp_err =
-				R_IIC_MASTER_Write(&data->control_ctrl, current->buf, current->len,
-						   next != NULL && (next->flags & I2C_MSG_RESTART));
-		}
-
-		if (fsp_err != FSP_SUCCESS) {
-			LOG_ERR("msg=%d %s failed, FSP_ERR=%d",
-                msg_idx,
-                (current->flags & I2C_MSG_READ) ? "read" : "write",
-                fsp_err);
-			ret = -EIO;
-			goto RELEASE_BUS;
-		}
-		/* Wait for callback to return. */
-		k_sem_take(&data->complete_sem, K_FOREVER);
-		LOG_DBG("msg=%d callback event=%d",
-            msg_idx, data->ctrl_event);
-#else
-
-#endif
-
-		/* Handle event msg from callback. */
-		switch (data->ctrl_event) {
-		case I2C_MASTER_EVENT_ABORTED:
-			LOG_ERR("%s: %s failed.", __func__,
-				(current->flags & I2C_MSG_READ) ? "Read" : "Write");
-			ret = -EIO;
-			goto RELEASE_BUS;
-		case I2C_MASTER_EVENT_RX_COMPLETE:
-			break;
-		case I2C_MASTER_EVENT_TX_COMPLETE:
-			break;
-		default:
-			break;
-		}
-
-		current++;
-		num_msgs--;
-		msg_idx++;
-	}
-
-RELEASE_BUS:
-	k_mutex_unlock(&data->bus_mutex);
-
-	return ret;
+    return -ETIMEDOUT;
 }
+
+
+static void i2c_ra_iic_abort_and_recover(struct i2c_ra_iic_data *data)
+{
+    fsp_err_t abort_err;
+
+    /*
+     * Remove a stale callback token before requesting an abort.
+     * If Abort generates a callback, consume that callback below.
+     */
+    k_sem_reset(&data->complete_sem);
+    data->ctrl_event = 0;
+
+    abort_err = R_IIC_MASTER_Abort(&data->control_ctrl);
+
+    if (abort_err == FSP_SUCCESS) {
+        /*
+         * Abort completion may be asynchronous. Do not wait forever:
+         * some FSP states do not generate an abort callback.
+         */
+        (void)k_sem_take(&data->complete_sem, K_MSEC(10));
+    } else {
+        LOG_WRN("R_IIC_MASTER_Abort returned FSP_ERR=%d",
+            abort_err);
+    }
+
+    /*
+     * Ensure that a late abort callback cannot satisfy the semaphore
+     * wait for the next real I2C message.
+     */
+    k_sem_reset(&data->complete_sem);
+    data->ctrl_event = 0;
+
+    /*
+     * The abort should generate/release STOP. This bounded wait also
+     * gives the FSP state machine time to return to idle.
+     */
+    if (i2c_ra_iic_wait_bus_idle(
+            data, I2C_RA_IIC_BUS_IDLE_TIMEOUT_US) != 0) {
+        LOG_ERR("IIC bus remains busy after abort, BBSY=%u",
+            data->control_ctrl.p_reg->ICCR2_b.BBSY);
+    }
+}
+
+static int i2c_ra_iic_transfer(const struct device *dev,
+                   struct i2c_msg *msgs,
+                   uint8_t num_msgs,
+                   uint16_t addr)
+{
+    struct i2c_ra_iic_data *data =
+        (struct i2c_ra_iic_data *const)dev->data;
+    i2c_master_addr_mode_t addr_mode;
+    fsp_err_t fsp_err;
+    uint8_t transaction_attempt;
+    int ret = 0;
+
+    if ((msgs == NULL) || (num_msgs == 0U)) {
+        return -EINVAL;
+    }
+
+    /*
+     * Validate and prepare all messages before acquiring the bus.
+     *
+     * The first message needs START. For the RA FSP driver, this is
+     * represented by I2C_MSG_RESTART.
+     */
+    msgs[0].flags |= I2C_MSG_RESTART;
+
+    for (uint8_t i = 0U; i < num_msgs; i++) {
+        struct i2c_msg *current = &msgs[i];
+
+        if (i < (num_msgs - 1U)) {
+            struct i2c_msg *next = &msgs[i + 1U];
+
+            /*
+             * A direction change requires a repeated START on the
+             * following message.
+             */
+            if ((OPERATION(current) != OPERATION(next)) &&
+                !(next->flags & I2C_MSG_RESTART)) {
+                LOG_ERR("Restart required between messages of "
+                    "different direction: %u/%u",
+                    i + 1U, num_msgs);
+                return -EIO;
+            }
+
+            /*
+             * STOP may only appear on the final message.
+             */
+            if (current->flags & I2C_MSG_STOP) {
+                LOG_ERR("STOP is only allowed on final message: "
+                    "%u/%u",
+                    i + 1U, num_msgs);
+                return -EIO;
+            }
+        } else {
+            current->flags |= I2C_MSG_STOP;
+        }
+    }
+
+    if (I2C_MSG_ADDR_10_BITS & data->dev_config) {
+        addr_mode = I2C_MASTER_ADDR_MODE_10BIT;
+    } else {
+        addr_mode = I2C_MASTER_ADDR_MODE_7BIT;
+    }
+
+    k_mutex_lock(&data->bus_mutex, K_FOREVER);
+
+    /*
+     * Retry the complete transaction once after recovery. A complete
+     * retry is required for write/repeated-start/read transactions:
+     * retrying only the read after abort would lose the register
+     * address written by message 0.
+     */
+    for (transaction_attempt = 0U;
+         transaction_attempt <= I2C_RA_IIC_RECOVERY_RETRIES;
+         transaction_attempt++) {
+        struct i2c_msg *current = msgs;
+        uint8_t remaining = num_msgs;
+        uint8_t msg_idx = 0U;
+        bool retry_transaction = false;
+		uint8_t start_reg = 0xff;
+
+		if (!(msgs[0].flags & I2C_MSG_READ) && msgs[0].len > 0U) {
+    		start_reg = msgs[0].buf[0];
+		}
+        /*
+         * BBSY must be zero at the beginning of a completely new
+         * Zephyr transaction. It is allowed to remain one only
+         * between messages connected by a repeated START.
+         */
+        ret = i2c_ra_iic_wait_bus_idle(
+            data, I2C_RA_IIC_BUS_IDLE_TIMEOUT_US);
+
+        if (ret != 0) {
+            LOG_ERR("IIC bus busy at transaction entry: "
+                "attempt=%u BBSY=%u",
+                transaction_attempt,
+                data->control_ctrl.p_reg->ICCR2_b.BBSY);
+
+            if (transaction_attempt <
+                I2C_RA_IIC_RECOVERY_RETRIES) {
+                i2c_ra_iic_abort_and_recover(data);
+                continue;
+            }
+
+            ret = -EBUSY;
+            goto release_bus;
+        }
+
+        /*
+         * Set the target address once for this complete transaction.
+         * The original driver ignored this return value.
+         */
+        fsp_err = R_IIC_MASTER_SlaveAddressSet(
+            &data->control_ctrl, addr, addr_mode);
+
+        if (fsp_err != FSP_SUCCESS) {
+            LOG_ERR("SlaveAddressSet failed: addr=0x%02x "
+                "FSP_ERR=%d BBSY=%u",
+                addr, fsp_err,
+                data->control_ctrl.p_reg->ICCR2_b.BBSY);
+
+            ret = (fsp_err == FSP_ERR_IN_USE) ?
+                -EBUSY : -EIO;
+
+            if (transaction_attempt <
+                I2C_RA_IIC_RECOVERY_RETRIES) {
+                i2c_ra_iic_abort_and_recover(data);
+                continue;
+            }
+
+            goto release_bus;
+        }
+
+        while (remaining > 0U) {
+            struct i2c_msg *next = NULL;
+            bool restart_after;
+            bool last_msg;
+
+            if (remaining > 1U) {
+                next = current + 1;
+            }
+
+            restart_after =
+                (next != NULL) &&
+                ((next->flags & I2C_MSG_RESTART) != 0U);
+
+            last_msg = (remaining == 1U);
+
+            LOG_DBG("attempt=%u msg=%u %c flags=0x%x "
+                "len=%u restart_after=%u BBSY=%u",
+                transaction_attempt,
+                msg_idx,
+                (current->flags & I2C_MSG_READ) ?
+                    'R' : 'W',
+                current->flags,
+                current->len,
+                restart_after,
+                data->control_ctrl.p_reg->ICCR2_b.BBSY);
+
+            /*
+             * A stale callback/semaphore token must not complete
+             * this new operation.
+             */
+            k_sem_reset(&data->complete_sem);
+            data->ctrl_event = 0;
+
+            if (current->flags & I2C_MSG_READ) {
+                fsp_err = R_IIC_MASTER_Read(
+                    &data->control_ctrl,
+                    current->buf,
+                    current->len,
+                    restart_after);
+            } else {
+                fsp_err = R_IIC_MASTER_Write(
+                    &data->control_ctrl,
+                    current->buf,
+                    current->len,
+                    restart_after);
+            }
+
+            if (fsp_err != FSP_SUCCESS) {
+                if (fsp_err == FSP_ERR_INVALID_SIZE) {
+                    LOG_ERR("msg=%u invalid transfer size",
+                        msg_idx);
+                    ret = -EINVAL;
+                } else if (fsp_err == FSP_ERR_IN_USE) {
+                    LOG_ERR("msg=%u %s returned IN_USE, "
+                        "BBSY=%u",
+                        msg_idx,
+                        (current->flags &
+                         I2C_MSG_READ) ?
+                            "read" : "write",
+                        data->control_ctrl.p_reg->
+                            ICCR2_b.BBSY);
+                    ret = -EBUSY;
+                } else {
+                    LOG_ERR("msg=%u %s failed, "
+                        "FSP_ERR=%d BBSY=%u",
+                        msg_idx,
+                        (current->flags &
+                         I2C_MSG_READ) ?
+                            "read" : "write",
+                        fsp_err,
+                        data->control_ctrl.p_reg->
+                            ICCR2_b.BBSY);
+                    ret = -EIO;
+                }
+
+                retry_transaction = true;
+                break;
+            }
+
+            /*
+             * Wait for the FSP callback, but never indefinitely.
+             */
+            if (k_sem_take(
+                    &data->complete_sem,
+                    K_MSEC(
+                        I2C_RA_IIC_CALLBACK_TIMEOUT_MS)) !=
+                0) {
+                LOG_ERR("msg=%u callback timeout, BBSY=%u",
+                    msg_idx,
+                    data->control_ctrl.p_reg->
+                        ICCR2_b.BBSY);
+
+                ret = -ETIMEDOUT;
+                retry_transaction = true;
+                break;
+            }
+
+            LOG_DBG("attempt=%u msg=%u event=%d BBSY=%u",
+                transaction_attempt,
+                msg_idx,
+                data->ctrl_event,
+                data->control_ctrl.p_reg->ICCR2_b.BBSY);
+
+            switch (data->ctrl_event) {
+            // case I2C_MASTER_EVENT_ABORTED:
+            //     LOG_ERR("msg=%u %s callback aborted",
+            //         msg_idx,
+            //         (current->flags &
+            //          I2C_MSG_READ) ?
+            //             "read" : "write");
+            //     ret = -EIO;
+            //     retry_transaction = true;
+            //     break;
+			case I2C_MASTER_EVENT_ABORTED:
+				// LOG_ERR("msg=%u %s callback aborted: "
+				// 	"addr=0x%02x reg=0x%02x BBSY=%u ICSR2=0x%02x",
+				// 	msg_idx,
+				// 	(current->flags & I2C_MSG_READ) ?
+				// 		"read" : "write",
+				// 	addr,
+				// 	current->len > 0U ? current->buf[0] : 0U,
+				// 	data->control_ctrl.p_reg->ICCR2_b.BBSY,
+				// 	data->control_ctrl.p_reg->ICSR2);
+				LOG_ERR("msg=%u %s callback aborted: addr=0x%02x "
+					"start_reg=0x%02x BBSY=%u ICSR2=0x%02x",
+					msg_idx,
+					(current->flags & I2C_MSG_READ) ? "read" : "write",
+					addr, start_reg,
+					data->control_ctrl.p_reg->ICCR2_b.BBSY,
+					data->control_ctrl.p_reg->ICSR2);
+				/*
+				 * An aborted transfer leaves the FSP master
+				 * state machine mid-transaction. It MUST be
+				 * recovered before the next message, or the
+				 * following START stalls on the wire (observed
+				 * as START..~10ms..STOP..NACK on a scope) and
+				 * every subsequent transfer fails. Treat it
+				 * like the other recoverable errors: flag for
+				 * retry and fall through to the recovery path
+				 * below, which calls abort_and_recover().
+				 */
+				ret = -EIO;
+				// retry_transaction = true;
+				break;
+            case I2C_MASTER_EVENT_RX_COMPLETE:
+                if (!(current->flags & I2C_MSG_READ)) {
+                    LOG_WRN("msg=%u unexpected "
+                        "RX_COMPLETE for write",
+                        msg_idx);
+                }
+                break;
+
+            case I2C_MASTER_EVENT_TX_COMPLETE:
+                if (current->flags & I2C_MSG_READ) {
+                    LOG_WRN("msg=%u unexpected "
+                        "TX_COMPLETE for read",
+                        msg_idx);
+                }
+                break;
+
+            default:
+                LOG_ERR("msg=%u unexpected callback event=%d",
+                    msg_idx, data->ctrl_event);
+                ret = -EIO;
+                retry_transaction = true;
+                break;
+            }
+
+            if (retry_transaction) {
+                break;
+            }
+
+            if (last_msg) {
+                /*
+                 * The callback can be observed just before
+                 * the hardware completes STOP. Do not release
+                 * bus_mutex until BBSY is zero.
+                 */
+                ret = i2c_ra_iic_wait_bus_idle(
+                    data,
+                    I2C_RA_IIC_BUS_IDLE_TIMEOUT_US);
+
+                if (ret != 0) {
+                    LOG_ERR("Final STOP timeout: "
+                        "msg=%u BBSY=%u",
+                        msg_idx,
+                        data->control_ctrl.p_reg->
+                            ICCR2_b.BBSY);
+
+                    ret = -ETIMEDOUT;
+                    retry_transaction = true;
+                    break;
+                }
+            } else {
+                /*
+                 * BBSY=1 is expected here because the bus is
+                 * intentionally retained for repeated START.
+                 * Do not wait for bus idle between messages.
+                 *
+                 * Give the FSP ISR/state machine a few
+                 * microseconds to move from completion to the
+                 * state that accepts the next Read/Write API.
+                 */
+                k_busy_wait(I2C_RA_IIC_RESTART_SETTLE_US);
+            }
+
+            current++;
+            remaining--;
+            msg_idx++;
+        }
+
+        if (!retry_transaction && (remaining == 0U)) {
+            ret = 0;
+            goto release_bus;
+        }
+
+        if (transaction_attempt <
+            I2C_RA_IIC_RECOVERY_RETRIES) {
+            LOG_WRN("Recovering IIC and retrying complete "
+                "transaction: addr=0x%02x ret=%d",
+                addr, ret);
+
+            i2c_ra_iic_abort_and_recover(data);
+            continue;
+        }
+
+        /*
+         * The final attempt failed. Recover the controller for the
+         * next caller but preserve this transaction's error.
+         */
+        {
+            int saved_ret = ret;
+
+            i2c_ra_iic_abort_and_recover(data);
+            ret = saved_ret;
+        }
+
+        goto release_bus;
+    }
+
+    /* The loop should always return through one of the paths above. */
+    ret = -EIO;
+
+release_bus:
+    k_mutex_unlock(&data->bus_mutex);
+
+	// LOG_ERR("IIC xfer exit: ret=%d event=%d "
+    // "BBSY=%u ICCR2=0x%02x ICSR2=0x%02x",
+    // ret,
+    // data->ctrl_event,
+    // data->control_ctrl.p_reg->ICCR2_b.BBSY,
+    // data->control_ctrl.p_reg->ICCR2,
+    // data->control_ctrl.p_reg->ICSR2);
+
+    return ret;
+}
+
+
 
 static void i2c_ra_iic_ctrl_callback(i2c_master_callback_args_t *p_args)
 {
@@ -310,6 +788,17 @@ static void i2c_ra_iic_ctrl_callback(i2c_master_callback_args_t *p_args)
 	struct i2c_ra_iic_data *data = dev->data;
 
 	data->ctrl_event = p_args->event;
+	atomic_val_t n = atomic_inc(&data->callback_count);
+	if(p_args->event==1)
+	{
+		LOG_ERR("FSP callback #%ld event=%d   "
+			" BBSY=%u ICCR2=0x%02x ICSR2=0x%02x",
+			(long)n,
+			p_args->event,
+			data->control_ctrl.p_reg->ICCR2_b.BBSY,
+			data->control_ctrl.p_reg->ICCR2,
+			data->control_ctrl.p_reg->ICSR2);
+	}
 
 	k_sem_give(&data->complete_sem);
 }

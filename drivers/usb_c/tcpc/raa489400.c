@@ -239,7 +239,7 @@ static int raa489400_init(const struct device *dev)
 	struct raa489400_data *data = dev->data;
 	uint8_t pwr_status;
 	int ret;
-
+	int asserted;
 	/* 1. Verify I2C bus is ready */
 	if (!i2c_is_ready_dt(&cfg->bus)) {
 		LOG_ERR("I2C bus not ready");
@@ -305,7 +305,7 @@ static int raa489400_init(const struct device *dev)
 	/* 6a. Enable VBUS voltage monitoring.
 	 *
 	 * POWER_CONTROL (0x1C) bit6 (VBUS_VOLTAGE Monitor) has a reset
-	 * value of 1b (monitoring DISABLED) — POWER_CONTROL resets to
+	 * value of 1b (monitoring DISABLED) — POWER_CONTROL resets to 
 	 * 0x62. While this bit is set, VBUS_VOLTAGE (0x70) reads all
 	 * zeroes. The zephyr,usb-c-vbus-tcpci VBUS driver reads VBUS
 	 * over I2C from register 0x70, so this bit MUST be cleared or
@@ -359,7 +359,11 @@ static int raa489400_init(const struct device *dev)
 	 * work handler would issue I2C while this init sequence is
 	 * still running, and the two would collide on the bus
 	 * ("Another transfer was in progress"). */
-	tcpci_write_reg16(&cfg->bus, TCPC_REG_ALERT, 0xFFFF);
+	ret = tcpci_write_reg16(&cfg->bus, TCPC_REG_ALERT, 0xffff);
+	if (ret != 0) {
+		LOG_ERR("Failed to clear TCPC ALERT register: %d", ret);
+		return ret;
+	}
 	data->initialized = true;
 
 	LOG_INF("RAA489400 TCPC initialized (addr 0x%02x)", cfg->bus.addr);
@@ -380,7 +384,17 @@ static int raa489400_init(const struct device *dev)
 	/* An alert may have latched between the 0xFFFF clear above and
 	 * the interrupt being enabled. With an edge-triggered line that
 	 * produces no new edge, so drain once explicitly. */
-	k_work_submit(&data->alert_work);
+	// k_work_submit(&data->alert_work);
+	asserted = gpio_pin_get_dt(&cfg->alert_gpio);
+	if (asserted < 0) {
+		LOG_ERR("Failed to read ALERT# GPIO: %d", asserted);
+		return asserted;
+	}
+
+	if (asserted != 0) {
+		LOG_INF("ALERT# already asserted after IRQ enable");
+		k_work_submit(&data->alert_work);
+	}
 
 	return 0;
 }
@@ -424,6 +438,10 @@ static int raa489400_set_cc(const struct device *dev, enum tc_cc_pull pull)
 
 	k_mutex_lock(&data->bus_lock, K_FOREVER);
 	ret = tcpci_tcpm_set_cc(&cfg->bus, pull);
+	// ret = tcpci_tcpm_set_cc(&cfg->bus, TC_CC_RD);
+	if (ret != 0) {
+        LOG_ERR("set_cc failed: pull=%d ret=%d", pull, ret);
+    }
 	k_mutex_unlock(&data->bus_lock);
 	return ret;
 }
@@ -743,159 +761,446 @@ static int raa489400_set_rx_enable(const struct device *dev, bool enable)
 #include <zephyr/sys/byteorder.h>
 #include <string.h>
 
+// static int raa489400_get_rx_pending_msg(const struct device *dev,
+//                     struct pd_msg *msg)
+// {
+//     const struct raa489400_cfg *cfg = dev->config;
+//     struct raa489400_data *data = dev->data;
+//     uint8_t buf[4 + sizeof(msg->data)];
+//     uint8_t count;
+//     size_t total;
+//     size_t payload_len;
+//     int ret;
+
+//     k_mutex_lock(&data->bus_lock, K_FOREVER);
+
+//     if (!data->msg_pending) {
+//         ret = -ENODATA;
+//         goto out;
+//     }
+
+//     /*
+//      * Read READABLE_BYTE_COUNT first. Do not clear RX_STATUS
+//      * until the complete message has been copied.
+//      */
+//     ret = tcpci_read_reg8(&cfg->bus, TCPC_REG_RX_BUFFER, &count);
+//     if (ret != 0) {
+//         LOG_ERR("Failed to read RX byte count: %d", ret);
+//         goto out;
+//     }
+
+//     /*
+//      * Count includes:
+//      *   RX_BUF_FRAME_TYPE: 1 byte
+//      *   PD header:         2 bytes
+//      *   payload:           0..28 bytes
+//      */
+//     if ((count < 3U) || (count > (3U + sizeof(msg->data)))) {
+//         LOG_WRN("Invalid RX byte count: %u", count);
+
+//         /*
+//          * Discard the invalid RX buffer and acknowledge RX_STATUS,
+//          * otherwise the stack may repeatedly request the same
+//          * invalid message.
+//          */
+//         (void)tcpci_write_reg8(&cfg->bus,
+//                       TCPC_REG_COMMAND,
+//                       TCPC_REG_COMMAND_RESET_RECEIVE_BUF);
+
+//         (void)tcpci_write_reg16(&cfg->bus,
+//                        TCPC_REG_ALERT,
+//                        TCPC_REG_ALERT_RX_STATUS);
+
+//         data->msg_pending = false;
+//         ret = -EBADMSG;
+//         goto out;
+//     }
+
+//     /*
+//      * Include the count byte itself:
+//      *   buf[0] = count
+//      *   buf[1] = frame type
+//      *   buf[2..3] = header
+//      *   buf[4..] = data objects
+//      */
+//     total = (size_t)count + 1U;
+
+//     ret = i2c_burst_read_dt(&cfg->bus,
+//                 TCPC_REG_RX_BUFFER,
+//                 buf,
+//                 total);
+//     if (ret != 0) {
+//         LOG_ERR("Failed to read RX buffer: %d", ret);
+//         goto out;
+//     }
+
+//     if (buf[0] != count) {
+//         LOG_WRN("RX count changed: initial=%u burst=%u",
+//             count, buf[0]);
+//         ret = -EAGAIN;
+//         goto out;
+//     }
+
+//     payload_len = (size_t)count - 3U;
+
+//     msg->type = buf[1];
+//     msg->header.raw_value = sys_get_le16(&buf[2]);
+//     msg->len = payload_len;
+
+//     if (payload_len != 0U) {
+//         memcpy(msg->data, &buf[4], payload_len);
+//     }
+
+//     // LOG_INF("RX count=%u type=0x%02x header=0x%04x payload=%u",
+//     //     count, msg->type, msg->header.raw_value,
+//     //     (unsigned int)payload_len);
+// 	LOG_INF("RX count=%u type=0x%02x header=0x%04x payload=%u PDO0=0x%08x",
+// 		count,
+// 		msg->type,
+// 		msg->header.raw_value,
+// 		(unsigned int)payload_len,
+// 		payload_len >= 4U ? msg->data[0] : 0U);
+
+// 	uint8_t ndo = (msg->header.raw_value >> 12) & 0x7U;
+
+// 	if ((size_t)ndo * sizeof(uint32_t) != payload_len) {
+// 		LOG_ERR("RX length mismatch: NDO=%u payload=%u",
+// 			ndo, (unsigned int)payload_len);
+// 		ret = -EBADMSG;
+// 		goto out;
+// 	}
+//     /*
+//      * Message has now been copied safely. Release the TCPC RX
+//      * buffer by clearing RX_STATUS.
+//      */
+//     ret = tcpci_write_reg16(&cfg->bus,
+//                 TCPC_REG_ALERT,
+//                 TCPC_REG_ALERT_RX_STATUS);
+//     if (ret != 0) {
+//         LOG_ERR("Failed to clear RX_STATUS: %d", ret);
+//         goto out;
+//     }
+
+// 	LOG_INF("RX returning success: type=0x%02x header=0x%04x len=%u",
+// 		msg->type, msg->header.raw_value, msg->len);
+	
+// 	data->msg_pending = false;
+// 	ret = 0;
+
+// out:
+//     k_mutex_unlock(&data->bus_lock);
+//     return ret;
+// }
+
 static int raa489400_get_rx_pending_msg(const struct device *dev,
                     struct pd_msg *msg)
 {
     const struct raa489400_cfg *cfg = dev->config;
     struct raa489400_data *data = dev->data;
-    uint8_t buf[4 + sizeof(msg->data)];
+    uint8_t buf[4U + sizeof(msg->data)];
     uint8_t count;
+    uint8_t ndo;
     size_t total;
     size_t payload_len;
+    uint32_t pdo0 = 0U;
     int ret;
+
+    if (msg == NULL) {
+        return -EINVAL;
+    }
 
     k_mutex_lock(&data->bus_lock, K_FOREVER);
 
     if (!data->msg_pending) {
-        ret = -ENODATA;
+        // ret = -ENODATA;
+		ret = 0;
         goto out;
     }
 
-    /*
-     * Read READABLE_BYTE_COUNT first. Do not clear RX_STATUS
-     * until the complete message has been copied.
-     */
-    ret = tcpci_read_reg8(&cfg->bus, TCPC_REG_RX_BUFFER, &count);
-    if (ret != 0) {
-        LOG_ERR("Failed to read RX byte count: %d", ret);
-        goto out;
-    }
+    for (int attempt = 0; attempt < 2; attempt++) {
+        /*
+         * READABLE_BYTE_COUNT includes:
+         *   frame type: 1 byte
+         *   PD header:  2 bytes
+         *   payload:    0..28 bytes
+         */
+        ret = tcpci_read_reg8(&cfg->bus,
+                      TCPC_REG_RX_BUFFER,
+                      &count);
+        if (ret != 0) {
+            LOG_ERR("Failed to read RX byte count: %d", ret);
+            goto out;
+        }
 
-    /*
-     * Count includes:
-     *   RX_BUF_FRAME_TYPE: 1 byte
-     *   PD header:         2 bytes
-     *   payload:           0..28 bytes
-     */
-    if ((count < 3U) || (count > (3U + sizeof(msg->data)))) {
-        LOG_WRN("Invalid RX byte count: %u", count);
+        if ((count < 3U) ||
+            (count > (3U + sizeof(msg->data)))) {
+            int reset_ret;
+            int clear_ret;
+
+            LOG_WRN("Invalid RX byte count: %u", count);
+
+            reset_ret = tcpci_write_reg8(
+                &cfg->bus,
+                TCPC_REG_COMMAND,
+                TCPC_REG_COMMAND_RESET_RECEIVE_BUF);
+
+            clear_ret = tcpci_write_reg16(
+                &cfg->bus,
+                TCPC_REG_ALERT,
+                TCPC_REG_ALERT_RX_STATUS);
+
+            if (reset_ret != 0) {
+                LOG_ERR("Failed to reset RX buffer: %d",
+                    reset_ret);
+            }
+
+            if (clear_ret != 0) {
+                LOG_ERR("Failed to clear RX_STATUS: %d",
+                    clear_ret);
+            }
+
+            if ((reset_ret == 0) || (clear_ret == 0)) {
+                data->msg_pending = false;
+            }
+
+            ret = -EBADMSG;
+            goto out;
+        }
 
         /*
-         * Discard the invalid RX buffer and acknowledge RX_STATUS,
-         * otherwise the stack may repeatedly request the same
-         * invalid message.
+         * Read from 0x30:
+         *   buf[0]    = READABLE_BYTE_COUNT
+         *   buf[1]    = RX_BUF_FRAME_TYPE
+         *   buf[2..3] = PD header, little-endian
+         *   buf[4..]  = data objects
          */
-        (void)tcpci_write_reg8(&cfg->bus,
-                      TCPC_REG_COMMAND,
-                      TCPC_REG_COMMAND_RESET_RECEIVE_BUF);
+        total = (size_t)count + 1U;
 
-        (void)tcpci_write_reg16(&cfg->bus,
-                       TCPC_REG_ALERT,
-                       TCPC_REG_ALERT_RX_STATUS);
+        ret = i2c_burst_read_dt(&cfg->bus,
+                    TCPC_REG_RX_BUFFER,
+                    buf,
+                    total);
+        if (ret != 0) {
+            LOG_ERR("Failed to read RX buffer: %d", ret);
+            goto out;
+        }
 
-        data->msg_pending = false;
-        ret = -EBADMSG;
-        goto out;
-    }
+        if (buf[0] == count) {
+            break;
+        }
 
-    /*
-     * Include the count byte itself:
-     *   buf[0] = count
-     *   buf[1] = frame type
-     *   buf[2..3] = header
-     *   buf[4..] = data objects
-     */
-    total = (size_t)count + 1U;
-
-    ret = i2c_burst_read_dt(&cfg->bus,
-                TCPC_REG_RX_BUFFER,
-                buf,
-                total);
-    if (ret != 0) {
-        LOG_ERR("Failed to read RX buffer: %d", ret);
-        goto out;
-    }
-
-    if (buf[0] != count) {
         LOG_WRN("RX count changed: initial=%u burst=%u",
             count, buf[0]);
-        ret = -EAGAIN;
-        goto out;
+
+        if (attempt == 1) {
+            ret = -EAGAIN;
+            goto out;
+        }
     }
 
     payload_len = (size_t)count - 3U;
 
     msg->type = buf[1];
     msg->header.raw_value = sys_get_le16(&buf[2]);
+
+    ndo = (msg->header.raw_value >> 12) & 0x7U;
+
+    if (((size_t)ndo * sizeof(uint32_t)) != payload_len) {
+        LOG_ERR("RX length mismatch: NDO=%u payload=%u",
+            ndo, (unsigned int)payload_len);
+
+        /*
+         * This packet is malformed. Discard it so the stack
+         * does not repeatedly request the same RX buffer.
+         */
+        (void)tcpci_write_reg8(
+            &cfg->bus,
+            TCPC_REG_COMMAND,
+            TCPC_REG_COMMAND_RESET_RECEIVE_BUF);
+
+        (void)tcpci_write_reg16(
+            &cfg->bus,
+            TCPC_REG_ALERT,
+            TCPC_REG_ALERT_RX_STATUS);
+
+        data->msg_pending = false;
+        ret = -EBADMSG;
+        goto out;
+    }
+
     msg->len = payload_len;
 
     if (payload_len != 0U) {
         memcpy(msg->data, &buf[4], payload_len);
     }
 
-    // LOG_INF("RX count=%u type=0x%02x header=0x%04x payload=%u",
-    //     count, msg->type, msg->header.raw_value,
-    //     (unsigned int)payload_len);
-	LOG_INF("RX count=%u type=0x%02x header=0x%04x payload=%u PDO0=0x%08x",
-		count,
-		msg->type,
-		msg->header.raw_value,
-		(unsigned int)payload_len,
-		payload_len >= 4U ? msg->data[0] : 0U);
+    if (payload_len >= sizeof(uint32_t)) {
+        pdo0 = sys_get_le32(&buf[4]);
+    }
 
-	uint8_t ndo = (msg->header.raw_value >> 12) & 0x7U;
+    LOG_INF("RX count=%u type=0x%02x header=0x%04x "
+        "NDO=%u payload=%u PDO0=0x%08x",
+        count,
+        msg->type,
+        msg->header.raw_value,
+        ndo,
+        (unsigned int)payload_len,
+        pdo0);
 
-	if ((size_t)ndo * sizeof(uint32_t) != payload_len) {
-		LOG_ERR("RX length mismatch: NDO=%u payload=%u",
-			ndo, (unsigned int)payload_len);
-		ret = -EBADMSG;
-		goto out;
-	}
     /*
-     * Message has now been copied safely. Release the TCPC RX
-     * buffer by clearing RX_STATUS.
+     * The complete packet has now been copied. Clear RX_STATUS
+     * to release the TCPC receive buffer.
      */
     ret = tcpci_write_reg16(&cfg->bus,
                 TCPC_REG_ALERT,
                 TCPC_REG_ALERT_RX_STATUS);
     if (ret != 0) {
-        LOG_ERR("Failed to clear RX_STATUS: %d", ret);
+        LOG_ERR("RX copied, but clearing RX_STATUS failed: %d",
+            ret);
         goto out;
     }
 
-	LOG_INF("RX returning success: type=0x%02x header=0x%04x len=%u",
-		msg->type, msg->header.raw_value, msg->len);
-	
-	data->msg_pending = false;
-	ret = 0;
+    data->msg_pending = false;
+
+    LOG_INF("RX returning success: type=0x%02x "
+        "header=0x%04x len=%u",
+        msg->type,
+        msg->header.raw_value,
+        msg->len);
+
+    ret = 1;
 
 out:
     k_mutex_unlock(&data->bus_lock);
     return ret;
 }
+
 /* ================================================================
  * tcpc_driver_api: transmit_data
  *
  * Delegates to tcpci_tcpm_transmit_data() which writes the TX buffer
  * (I2C_WRITE_BYTE_COUNT + TX_BUF_BYTE_x) then TRANSMIT (0x50).
  * ================================================================ */
-static int raa489400_transmit_data(const struct device *dev,
-				   struct pd_msg *msg)
-{
-	const struct raa489400_cfg *cfg = dev->config;
-	struct raa489400_data *data = dev->data;
-	int ret;
+// static int raa489400_transmit_data(const struct device *dev,
+// 				   struct pd_msg *msg)
+// {
+// 	const struct raa489400_cfg *cfg = dev->config;
+// 	struct raa489400_data *data = dev->data;
+// 	int ret;
 
-    LOG_INF("TX request: type=0x%02x header=0x%04x len=%u",
+//     LOG_INF("TX request: type=0x%02x header=0x%04x len=%u",
+//         msg->type, msg->header.raw_value, msg->len);
+
+//     if (msg->len >= sizeof(uint32_t)) {
+//         LOG_INF("TX DO0=0x%08x", msg->data[0]);
+//     }
+
+// 	/* 3 retries per USB PD specification */
+// 	k_mutex_lock(&data->bus_lock, K_FOREVER);
+// 	ret = tcpci_tcpm_transmit_data(&cfg->bus, msg, 3);
+// 	k_mutex_unlock(&data->bus_lock);
+// 	LOG_INF("TX result=%d", ret);
+// 	return ret;
+// }
+#include <string.h>
+#include <zephyr/sys/byteorder.h>
+
+static int raa489400_transmit_data(const struct device *dev,
+                   struct pd_msg *msg)
+{
+    const struct raa489400_cfg *cfg = dev->config;
+    struct raa489400_data *data = dev->data;
+
+    /*
+     * Register address + byte count + PD header + maximum payload.
+     */
+    uint8_t tx_buf[1U + 1U + 2U + sizeof(msg->data)];
+    uint8_t transmit;
+    size_t tx_len;
+    int ret;
+
+    if (msg == NULL) {
+        return -EINVAL;
+    }
+
+    k_mutex_lock(&data->bus_lock, K_FOREVER);
+
+    LOG_INF("TX: type=0x%02x header=0x%04x len=%u",
         msg->type, msg->header.raw_value, msg->len);
 
-	/* 3 retries per USB PD specification */
-	k_mutex_lock(&data->bus_lock, K_FOREVER);
-	ret = tcpci_tcpm_transmit_data(&cfg->bus, msg, 3);
-	k_mutex_unlock(&data->bus_lock);
-	return ret;
-}
+    /*
+     * Hard Reset, Cable Reset, and BIST Carrier Mode 2 do not use
+     * the normal TX buffer.
+     */
+    if (msg->type >= RAA489400_TX_HARD_RESET) {
+        transmit = msg->type & RAA489400_TX_SOP_TYPE_MASK;
 
+        ret = tcpci_write_reg8(&cfg->bus,
+                       RAA489400_REG_TRANSMIT,
+                       transmit);
+        goto out;
+    }
+
+    if (msg->len > sizeof(msg->data)) {
+        ret = -EMSGSIZE;
+        goto out;
+    }
+
+    /*
+     * Create one complete I2C write:
+     *
+     * tx_buf[0] = register address, 0x51
+     * tx_buf[1] = I2C_WRITE_BYTE_COUNT
+     * tx_buf[2] = PD header low byte
+     * tx_buf[3] = PD header high byte
+     * tx_buf[4...] = data objects
+     *
+     * I2C_WRITE_BYTE_COUNT includes the two-byte PD header and
+     * payload, but not the register address or count byte.
+     */
+    tx_buf[0] = RAA489400_REG_TX_BUFFER;
+    tx_buf[1] = 2U + msg->len;
+
+    sys_put_le16(msg->header.raw_value, &tx_buf[2]);
+
+    if (msg->len > 0U) {
+        memcpy(&tx_buf[4], msg->data, msg->len);
+    }
+
+    tx_len = 4U + msg->len;
+
+    LOG_HEXDUMP_DBG(tx_buf, tx_len, "TCPC TX buffer write");
+
+    /*
+     * One i2c_write_dt() call guarantees one continuous transaction.
+     */
+    ret = i2c_write_dt(&cfg->bus, tx_buf, tx_len);
+    if (ret != 0) {
+        LOG_ERR("TX buffer write failed: %d", ret);
+        goto out;
+    }
+
+    /*
+     * Retry count = 3, packet type from msg->type.
+     */
+    transmit = RAA489400_TX_RETRY_3 |
+           (msg->type & RAA489400_TX_SOP_TYPE_MASK);
+
+    ret = tcpci_write_reg8(&cfg->bus,
+                   RAA489400_REG_TRANSMIT,
+                   transmit);
+    if (ret != 0) {
+        LOG_ERR("TRANSMIT command 0x%02x failed: %d",
+            transmit, ret);
+        goto out;
+    }
+
+    LOG_INF("TX submitted: TRANSMIT=0x%02x", transmit);
+
+out:
+    k_mutex_unlock(&data->bus_lock);
+    return ret;
+}
 /* ================================================================
  * tcpc_driver_api: get_status_register
  *
@@ -1012,7 +1317,7 @@ static void raa489400_alert_work_handler(struct k_work *work)
 	if (!data->initialized) {
 		return;
 	}
-
+	LOG_INF("ALERT work entered");
 	/* Serialize against the USB-C stack thread's TCPC calls. k_mutex is
 	 * recursive, so the synchronous data->alert_handler() callbacks
 	 * below (which re-enter this driver's locked API functions on the
@@ -1079,18 +1384,16 @@ static void raa489400_alert_work_handler(struct k_work *work)
 		// 	data->msg_pending = true;
 		// 	break;
 		case TCPC_ALERT_MSG_STATUS:
+			data->msg_pending = true;
 			/*
 			* Do not clear RX_STATUS here. Clearing it may release the
 			* TCPC RX buffer before get_rx_pending_msg() reads it.
 			*/
-			data->msg_pending = true;
-
+			alert_reg &= ~TCPC_REG_ALERT_RX_STATUS;
 			if (data->alert_handler) {
 				data->alert_handler(dev, data->alert_handler_data,
 							TCPC_ALERT_MSG_STATUS);
 			}
-
-			alert_reg &= ~TCPC_REG_ALERT_RX_STATUS;
     		continue;		
 		case TCPC_ALERT_HARD_RESET_RECEIVED:
 			bit = TCPC_REG_ALERT_RX_HARD_RST;
@@ -1173,6 +1476,7 @@ static void raa489400_alert_gpio_cb(const struct device *port,
 	ARG_UNUSED(port);
 	ARG_UNUSED(pins);
 
+ 	LOG_INF("ALERT# GPIO IRQ fired");
 	k_work_submit(&data->alert_work);
 }
 
